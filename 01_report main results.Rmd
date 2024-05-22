@@ -1,0 +1,555 @@
+---
+title: "VIREMIA KINETICS - Main results"
+author: "Nguyen Lam Vuong"
+date: "22 May 2024"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r load packages, message=FALSE, warning=FALSE, include=FALSE}
+library(tidyverse)
+library(gridExtra)
+library(gtsummary)
+library(rms)
+library(MCMCglmm)
+library(lme4)
+library(geepack)
+
+theme_set(theme_bw())
+options(knitr.kable.NA = '')
+options(gtsummary.pvalue_fun = function(x) style_pvalue(x, digits = 3))
+options(gtsummary.tbl_summary.percent_fun = function(x) sprintf(x * 100, fmt='%1.f'))
+
+# Function to get prediction from linear mixed-effects model
+get_pred_lmer <- function(model, outcome, data, transform = "identical") {
+  datp <- data
+  text <- paste("datp$", outcome, " <- predict(model, datp, re.form=NA)", sep="")
+  fit <- eval(parse(text = text))
+  datp[[outcome]] <- fit
+  mm <- model.matrix(terms(model), datp)
+  mm <- mm[, colnames(mm) %in% names(fixef(model))] ## to deal with rank deficient
+  pvar <- diag(mm %*% tcrossprod(vcov(model), mm))
+  critval <- qnorm(0.975) ## approx 95% CI
+  lwr = fit - critval * sqrt(pvar)
+  upr = fit + critval * sqrt(pvar)
+  
+  if (transform == "4root") {
+    datp$pred <- fit^4; datp$low <- lwr^4; datp$upp <- upr^4
+  } else {
+    if (transform == "log2") {
+      datp$pred <- 2^fit; datp$low <- 2^lwr; datp$upp <- 2^upr
+    } else {
+      if (transform == "log10") {
+        datp$pred <- 10^fit; datp$low <- 10^lwr; datp$upp <- 10^upr
+      } else {
+        datp$pred <- fit; datp$low <- lwr; datp$upp <- upr
+      }
+    }
+  }
+  
+  return(datp)
+}
+```
+
+
+```{r load and merge data, message=FALSE, warning=FALSE, include=FALSE}
+load("Viremia model censored 240522.RData")
+load("Platelet landmark model 240522.RData")
+load("Viremia and outcomes 240522.RData")
+load("Data with viremia decline rate 240522.RData")
+
+# Full data-----------------------------------------------------------------------------
+dat <- read_csv("Longitudinal viremia and platelet 22May2024.csv") %>%
+  mutate(Study = factor(Study, levels = c("DR", "MD", "22DX")),
+         Sex = factor(Sex, levels = c("Male", "Female")),
+         Serotype = factor(Serotype, levels = c("DENV-1", "DENV-2", "DENV-3", "DENV-4", "Mixed", "Unknown")),
+         Serology = factor(Serology, levels = c("Probable primary", "Probable secondary", "Indeterminate")),
+         PLT_sq = PLT^(1/4),
+         cAge = Age - 13,
+         PCR = ifelse(Study == "22DX", 1, 0),
+         PCR = factor(PCR, levels = c(0,1), labels = c("Two-step", "One-step")),
+         vir_tmp = case_when(vir==0 & Serotype %in% c("DENV-1", "DENV-3") & PCR=="One-step" ~ 300,
+                             vir==0 & Serotype=="DENV-2" & PCR=="One-step" ~ 60,
+                             vir==0 & Serotype=="DENV-4" & PCR=="One-step" ~ 600,
+                             vir==0 & PCR=="Two-step" ~ 1000,
+                             vir>0 ~ vir),
+         vir_tmp = ifelse(vir<1000 & PCR=="Two-step", 1000, vir_tmp), # 63 values in the 2-step PCR cohort are <1000 but detectable --> set them to undetectable
+         vir01_original = ifelse(vir==0, 1, 0),
+         vir01 = ifelse(vir<1000 & PCR=="Two-step", 1, vir01_original),
+         log10_vir = log10(vir_tmp), 
+         vir_10root = vir_tmp^.1) %>%
+  select(Study, Code, Age, cAge, Sex, Enrol_DOI, Serotype, Serology, PCR, DOI, PLT, PLT_sq, 
+         log10_vir, vir_10root, vir01_original, vir01, Severe_dengue, doi_severe, Leakage, doi_leakage)
+
+
+# Data for summary-----------------------------------------------------------------------------
+## Viremia kinetics
+dat_vir <- dat %>%
+  filter(DOI<=10) %>% # most were undetectable before day 10
+  filter(!is.na(log10_vir)) %>%
+  filter(!is.na(Serotype) & !Serotype %in% c("Mixed","Unknown")) %>% # exclude patients with negative PCR
+  mutate(Serotype = factor(Serotype, levels=c("DENV-1","DENV-2","DENV-3","DENV-4")))
+
+## Clinical summary
+dat_vir_sum <- dat_vir %>% group_by(Code) %>% slice(1) %>% ungroup()
+
+
+# Data for landmark models for clinical outcomes------------------------------------------------
+dat1 <- dat_vir %>%
+  rename(Severe = Severe_dengue) %>%
+  mutate(doi_severe = ifelse(Severe == 0, 10, doi_severe),
+         doi_leakage = ifelse(is.na(doi_leakage) & Leakage == 1, 5, # Impute 5 for missing doi_leakage
+                              ifelse(Leakage == 0, 10, doi_leakage))) # Max DOI of severe patients is 7
+
+## Create landmark data, taking into account DOI of occurring severe dengue
+dats1 <- dat1 %>% filter(doi_severe >= 1) %>% filter(DOI == 1) %>% mutate(LM = 1)
+dats2 <- dat1 %>% filter(doi_severe >= 2) %>% filter(DOI == 2) %>% mutate(LM = 2)
+dats3 <- dat1 %>% filter(doi_severe >= 3) %>% filter(DOI == 3) %>% mutate(LM = 3)
+dats4 <- dat1 %>% filter(doi_severe >= 4) %>% filter(DOI == 4) %>% mutate(LM = 4)
+dats5 <- dat1 %>% filter(doi_severe >= 5) %>% filter(DOI == 5) %>% mutate(LM = 5)
+dats6 <- dat1 %>% filter(doi_severe >= 6) %>% filter(DOI == 6) %>% mutate(LM = 6)
+dats7 <- dat1 %>% filter(doi_severe >= 7) %>% filter(DOI == 7) %>% mutate(LM = 7)
+
+LMdats1 <- bind_rows(dats1, dats2, dats3, dats4, dats5, dats6, dats7) %>%
+  arrange(Code, LM) %>%
+  mutate(Code = factor(Code),
+         cLM = LM - 3,
+         clog10_vir = log10_vir - 6.38)
+
+## Create landmark data for plasma leakage
+datl1 <- dat1 %>% filter(doi_leakage >= 1) %>% filter(DOI == 1) %>% mutate(LM = 1)
+datl2 <- dat1 %>% filter(doi_leakage >= 2) %>% filter(DOI == 2) %>% mutate(LM = 2)
+datl3 <- dat1 %>% filter(doi_leakage >= 3) %>% filter(DOI == 3) %>% mutate(LM = 3)
+datl4 <- dat1 %>% filter(doi_leakage >= 4) %>% filter(DOI == 4) %>% mutate(LM = 4)
+datl5 <- dat1 %>% filter(doi_leakage >= 5) %>% filter(DOI == 5) %>% mutate(LM = 5)
+datl6 <- dat1 %>% filter(doi_leakage >= 6) %>% filter(DOI == 6) %>% mutate(LM = 6)
+datl7 <- dat1 %>% filter(doi_leakage >= 7) %>% filter(DOI == 7) %>% mutate(LM = 7)
+
+## Combine to landmark dataset
+LMdatl <- bind_rows(datl1, datl2, datl3, datl4, datl5, datl6, datl7) %>%
+  arrange(Code, LM) %>%
+  mutate(Code = factor(Code),
+         cLM = LM - 3,
+         clog10_vir = log10_vir - 6.38)
+
+
+# Data for landmark model for platelet count------------------------------------------------------
+dat0 <- dat %>%
+  filter(DOI<=10) %>% # most were undetectable before day 10
+  filter(!is.na(log10_vir)) %>%
+  filter(!is.na(Serotype) & !Serotype %in% c("Mixed","Unknown")) %>% # exclude patients with negative PCR or mixed serotype
+  mutate(Code = as.factor(Code),
+         Serotype = factor(Serotype, levels=c("DENV-1","DENV-2","DENV-3","DENV-4")),
+         Serology = relevel(Serology, ref="Probable secondary"))
+
+dat_vir1 <- dat0 %>% filter(DOI==1) %>% select(Code, log10_vir, vir01)
+dat_vir2 <- dat0 %>% filter(DOI==2) %>% select(Code, log10_vir, vir01)
+dat_vir3 <- dat0 %>% filter(DOI==3) %>% select(Code, log10_vir, vir01)
+dat_vir4 <- dat0 %>% filter(DOI==4) %>% select(Code, log10_vir, vir01)
+dat_vir5 <- dat0 %>% filter(DOI==5) %>% select(Code, log10_vir, vir01)
+dat_vir6 <- dat0 %>% filter(DOI==6) %>% select(Code, log10_vir, vir01)
+dat_vir7 <- dat0 %>% filter(DOI==7) %>% select(Code, log10_vir, vir01)
+
+dat_lm0 <- dat0 %>% select(Study, Code, PLT, PLT_sq, DOI, Age, cAge, Sex, Serotype, Serology, PCR)
+
+dat_lm1 <- dat_lm0 %>% filter(DOI>=1) %>% filter(Code %in% dat_vir1$Code) %>% 
+  left_join(., dat_vir1, by="Code") %>% mutate(LM = 1)
+dat_lm2 <- dat_lm0 %>% filter(DOI>=2) %>% filter(Code %in% dat_vir2$Code) %>% 
+  left_join(., dat_vir2, by="Code") %>% mutate(LM = 2)
+dat_lm3 <- dat_lm0 %>% filter(DOI>=3) %>% filter(Code %in% dat_vir3$Code) %>% 
+  left_join(., dat_vir3, by="Code") %>% mutate(LM = 3)
+dat_lm4 <- dat_lm0 %>% filter(DOI>=4) %>% filter(Code %in% dat_vir4$Code) %>% 
+  left_join(., dat_vir4, by="Code") %>% mutate(LM = 4)
+dat_lm5 <- dat_lm0 %>% filter(DOI>=5) %>% filter(Code %in% dat_vir5$Code) %>% 
+  left_join(., dat_vir5, by="Code") %>% mutate(LM = 5)
+dat_lm6 <- dat_lm0 %>% filter(DOI>=6) %>% filter(Code %in% dat_vir6$Code) %>% 
+  left_join(., dat_vir6, by="Code") %>% mutate(LM = 6)
+dat_lm7 <- dat_lm0 %>% filter(DOI>=7) %>% filter(Code %in% dat_vir7$Code) %>% 
+  left_join(., dat_vir7, by="Code") %>% mutate(LM = 7)
+
+LMdat <- bind_rows(dat_lm1, dat_lm2, dat_lm3, dat_lm4, dat_lm5, dat_lm6, dat_lm7) %>% 
+  arrange(Code, LM, DOI) %>% 
+  filter(!is.na(PLT)) %>%
+  mutate(LM_factor = as.factor(LM))
+
+
+# Data for viremia model------------------------------------------------------------------------
+dat_vir12 <- dat_vir %>%
+  filter(!(Serotype == "DENV-4" & PCR == "Two-step")) %>%
+  mutate(log10_vir_fake = ifelse(vir01==1, log10_vir-1, log10_vir),
+         ymax = log10_vir,
+         ymin = ifelse(vir01==1, -Inf, log10_vir)) %>%
+  as.data.frame(.)
+
+## Data for one-step PCR
+dat_vir1 <- dat_vir12 %>% filter(PCR == "One-step")
+
+## Data for two-step PCR
+dat_vir2 <- dat_vir12 %>% filter(PCR == "Two-step") %>% 
+  mutate(Serotype = factor(Serotype, levels=c("DENV-1", "DENV-2", "DENV-3")))
+```
+
+
+############################################################
+### Table 1. Baseline characteristics and clinical outcomes
+```{r table 1, echo=FALSE, message=FALSE, warning=FALSE}
+dat_vir_sum %>%
+  select(Study, Age, Sex, Enrol_DOI, Serotype, Serology, Leakage, doi_leakage, Severe_dengue, doi_severe) %>%
+  tbl_summary(by = Study,
+              missing_text = "Missing",
+              statistic = list(all_continuous() ~ "{median} ({p25}; {p75})", all_categorical() ~ "{n} ({p})"),
+              digits = list(all_continuous() ~ c(0,0)),
+              value = list(Sex ~ "Male"),
+              label = list(Age ~ "Age, years", Sex ~ "Sex male", Enrol_DOI ~ "Illness day at enrolment", Serology ~ "Immune status", Leakage ~ "Plasma leakage", doi_leakage ~ "Illness day of plasma leakage", Severe_dengue ~ "Severe dengue", doi_severe ~ "Illness day of severe dengue")) %>%
+  add_overall() %>%
+  add_n() %>%
+  modify_header(label = "", stat_0 = "All patients\n(N={N})", stat_by = "{level}\n(N={n})") %>%
+  as_flextable(include = -footnote)
+```
+
+
+############################################################
+### Figure 2. Individual trajectories of measured viremia levels
+```{r fig 2, message=TRUE, warning=TRUE, include=FALSE}
+## One-step PCR
+tmp1 <- expand.grid(Serotype = as.factor(c("DENV-1","DENV-2","DENV-3","DENV-4")),
+                    Serology = as.factor(c("Probable primary","Probable secondary","Indeterminate"))) %>%
+  mutate(LOD = case_when(Serotype %in% c("DENV-1", "DENV-3") ~ log10(300), 
+                         Serotype=="DENV-2" ~ log10(60),
+                         Serotype=="DENV-4" ~ log10(600)))
+
+#dat_dens1 <- dat_vir1 %>% filter(vir01 == 0) %>% mutate(DOI = as.factor(DOI))
+
+p1 <- ggplot(dat_vir1, aes(DOI, log10_vir_fake)) +
+  geom_hline(data = tmp1, aes(yintercept = LOD), linetype = "dashed", alpha = .5) +
+  #see::geom_violinhalf(data = dat_dens1, aes(DOI, log10_vir), alpha = .3, color = "blue", fill = "blue", scale = "width") +
+  geom_point(alpha = 0.5, color = "grey", size = 0.4) +
+  geom_line(aes(group = factor(Code)), alpha = 0.3, color = "black", size = 0.3) +
+  labs(y = "Viremia levels (log-10 copies/ml)", x = "Illness day", subtitle = "A - One-step PCR cohort") +
+  scale_y_continuous(breaks = c(0:10)*2) +
+  facet_grid(rows = vars(Serology), cols = vars(Serotype)) +
+  theme(plot.subtitle = element_text(face = "bold")) +
+  coord_cartesian(ylim = c(.5,11.8))
+
+## Two-step PCR
+tmp2 <- expand.grid(Serotype = as.factor(c("DENV-1","DENV-2","DENV-3")),
+                    Serology = as.factor(c("Probable primary","Probable secondary","Indeterminate"))) %>%
+  mutate(LOD = log10(1000))
+
+#dat_dens2 <- dat_vir2 %>% filter(log10_vir > log10(500)) %>% mutate(DOI = as.factor(DOI))
+
+p2 <- ggplot(dat_vir2, aes(DOI, log10_vir_fake)) +
+  geom_hline(data = tmp2, aes(yintercept = LOD), linetype = "dashed", alpha = .5) +
+  #see::geom_violinhalf(data = dat_dens2, aes(DOI, log10_vir), alpha = .3, color = "blue", fill = "blue", scale = "width") +
+  geom_point(alpha = 0.5, color = "grey", size = 0.4) +
+  geom_line(aes(group = factor(Code)), alpha = 0.3, color = "black", size = 0.3) +
+  labs(y = "Viremia levels (log-10 copies/ml)", x = "Illness day", subtitle = "B - Two-step PCR cohort") +
+  scale_y_continuous(breaks = c(0:10)*2) +
+  scale_x_continuous(breaks = c(0:10)*2) +
+  facet_grid(rows = vars(Serology), cols = vars(Serotype)) +
+  theme(plot.subtitle = element_text(face = "bold")) +
+  coord_cartesian(ylim = c(1,10.4))
+
+## Combine plots
+p <- grid.arrange(p1, p2, nrow = 2)
+ggsave("Fig2.jpg", p, width = 8, height = 10)
+```
+
+
+############################################################
+### Figure 3. Fitted trends in mean viremia levels
+```{r fig 3, message=TRUE, warning=TRUE, include=FALSE}
+tmp_lod1 <- expand.grid(Serotype = c("DENV-1","DENV-2","DENV-3","DENV-4"),
+                        Serology = c("Probable primary","Probable secondary","Indeterminate")) %>%
+  mutate(LOD = case_when(Serotype %in% c("DENV-1", "DENV-3") ~ log10(300), 
+                         Serotype=="DENV-2" ~ log10(60),
+                         Serotype=="DENV-4" ~ log10(600)),
+         Serology = factor(Serology, levels = c("Probable primary","Probable secondary","Indeterminate")))
+
+tmp_lod2 <- expand.grid(Serotype = c("DENV-1","DENV-2","DENV-3"),
+                        Serology = c("Probable primary","Probable secondary","Indeterminate")) %>%
+  mutate(LOD = log10(1000),
+         Serology = factor(Serology, levels = c("Probable primary","Probable secondary","Indeterminate")))
+
+# Data for prediction for left-censored model
+nDF <- expand.grid(cAge = c(-8,-3,2,12,37),
+                   Sex = as.factor(c("Male","Female")),
+                   DOI = c(10:105)*.1,
+                   Serotype = as.factor(c("DENV-1","DENV-2","DENV-3","DENV-4")),
+                   Serology = as.factor(c("Probable primary","Probable secondary","Indeterminate")),
+                   PCR = as.factor(c("Two-step", "One-step")),
+                   ymin = 0,
+                   ymax = 10,
+                   Code = unique(dat_vir12$Code)[1]) %>%
+  mutate(Serology = factor(Serology, levels=c("Probable primary","Probable secondary","Indeterminate")),
+         PCR = factor(PCR, levels=c("Two-step","One-step")),
+         Sex = factor(Sex, levels=c("Male", "Female")),
+         Code = as.character(Code)) %>%
+  filter(!(PCR=="Two-step" & Serotype=="DENV-4")) %>%
+  filter(!(PCR=="Two-step" & cAge %in% c(7, 17))) %>%
+  as.data.frame()
+
+pred18 <- predict(m18, newdata = nDF, interval = "confidence") %>% as.data.frame(.)
+pm <- bind_cols(nDF, pred18) %>%
+  mutate(lod = ifelse((Serotype == "DENV-2" & fit < log10(60) & PCR == "One-step") |
+                        (Serotype == "DENV-4" & fit < log10(600) & PCR == "One-step") |
+                        (Serotype %in% c("DENV-1", "DENV-3") & fit < log10(300) & PCR == "One-step") |
+                        (fit < log10(1000) & PCR == "Two-step"), "<LOD", ">LOD"),
+         lod = factor(lod, levels = c(">LOD", "<LOD")))
+
+# Compare serotype---------------------
+p1 <- ggplot(data = filter(pm, cAge==-3, Sex=="Male", PCR=="One-step")) +
+  geom_segment(data = tmp_lod1, aes(x=2, y=LOD, xend=11, yend=LOD), linetype = "solid", alpha = .8, size = .2) +
+  annotate("text", x = 2, y = log10(250), label = "D1,D3 ", size = 2.5, hjust = 1, vjust = .5) +
+  annotate("text", x = 2, y = log10(60), label = "D2 ", size = 2.5, hjust = 1, vjust = .5) +
+  annotate("text", x = 2, y = log10(700), label = "D4 ", size = 2.5, hjust = 1, vjust = .5) +
+  geom_ribbon(aes(x = DOI, ymin = lwr, ymax = upr, fill = Serotype), alpha = .2) +
+  geom_line(aes(x = DOI, y = fit, color = Serotype, linetype = lod), alpha = .8) +
+  labs(y = "Viremia levels (log-10 copies/ml)") +
+  scale_x_continuous(breaks = c(1:10)*2) +
+  scale_y_continuous(breaks = c(0:10)*2) +
+  scale_fill_discrete(name = "(A) Serotype          ") +
+  scale_color_discrete(name = "(A) Serotype          ") +
+  scale_linetype_discrete(guide = "none") +
+  theme(legend.position = "top", axis.title.x = element_blank(), legend.justification = 'left', legend.title = element_text(face = "bold")) +
+  coord_cartesian(ylim = c(1.7,9), xlim = c(1,10)) +
+  facet_grid(cols = vars(Serology))
+
+# Compare serology--------------------
+p2 <- ggplot(data = filter(pm, cAge==-3, Sex=="Male", PCR=="One-step")) +
+  geom_hline(data = tmp_lod1, aes(yintercept = LOD), linetype = "solid", alpha = .8, size = .2) +
+  geom_ribbon(aes(x = DOI, ymin = lwr, ymax = upr, fill = Serology), alpha = .2) +
+  geom_line(aes(x = DOI, y = fit, color = Serology, linetype = lod), alpha = .8) +
+  labs(x = "Illness day", y = "Viremia levels (log-10 copies/ml)") +
+  scale_x_continuous(breaks = c(1:10)*2) +
+  scale_y_continuous(breaks = c(0:10)*2) +
+  scale_fill_manual(name = "(B) Immune status          ", values = c("blue", "red", "#999999")) +
+  scale_color_manual(name = "(B) Immune status          ", values = c("blue", "red", "#999999")) +
+  scale_linetype_discrete(guide = "none") +
+  theme(legend.position = "top", legend.justification = 'left', legend.title = element_text(face = "bold"), axis.title.x = element_blank()) +
+  coord_cartesian(ylim = c(1.7,9), xlim = c(1,10)) +
+  facet_grid(cols = vars(Serotype))
+
+# Compare gender----------------
+p3 <- ggplot(data = filter(pm, Serotype=="DENV-1", Serology=="Probable secondary", cAge==-3, PCR=="One-step")) +
+  geom_segment(data = filter(tmp_lod1, Serotype=="DENV-1", Serology=="Probable secondary"), aes(x=1.1, y=LOD, xend=11, yend=LOD), linetype = "solid", alpha = .8, size = .2) +
+  annotate("text", x = 1.1, y = log10(250), label = "D1 ", size = 2.5, hjust = 1, vjust = .5) +
+  geom_ribbon(aes(x = DOI, ymin = lwr, ymax = upr, fill = Sex), alpha = .2) +
+  geom_line(aes(x = DOI, y = fit, color = Sex, linetype = lod), alpha = .8) +
+  labs(x = "Illness day", y = "Viremia levels (log-10 copies/ml)") +
+  scale_x_continuous(breaks = c(1:10)*2) +
+  scale_y_continuous(breaks = c(0:10)*2) +
+  scale_fill_manual(name = "(C) Sex  ", values = c("#E69F00", "#56B4E9")) +
+  scale_color_manual(name = "(C) Sex  ", values = c("#E69F00", "#56B4E9")) +
+  scale_linetype_discrete(guide = "none") +
+  coord_cartesian(ylim = c(1.7,9), xlim = c(1,10)) +
+  theme(legend.position = "top", legend.justification = 'left', legend.title = element_text(face = "bold"))
+
+# Compare Age------------------
+pdat <- pm %>% mutate(Age = as.factor(cAge + 13))
+p4 <- ggplot(data = filter(pdat, Serotype=="DENV-1", Serology=="Probable secondary", Sex=="Male", PCR=="One-step")) +
+  geom_segment(data = filter(tmp_lod1, Serotype=="DENV-1", Serology=="Probable secondary"), aes(x=1.1, y=LOD, xend=11, yend=LOD), linetype = "solid", alpha = .8, size = .2) +
+  annotate("text", x = 1.1, y = log10(250), label = "D1 ", size = 2.5, hjust = 1, vjust = .5) +
+  geom_ribbon(aes(x = DOI, ymin = lwr, ymax = upr, fill = Age), alpha = .2) +
+  geom_line(aes(x = DOI, y = fit, color = Age, linetype = lod), alpha = .8) +
+  labs(x = "Illness day", y = "Viremia levels (log-10 copies/ml)") +
+  scale_x_continuous(breaks = c(1:10)*2) +
+  scale_y_continuous(breaks = c(0:10)*2) +
+  scale_fill_brewer(name = "(D) Age ", palette = "Set1") +
+  scale_color_brewer(name = "(D) Age ", palette = "Set1") +
+  scale_linetype_discrete(guide = "none") +
+  coord_cartesian(ylim = c(1.7,9), xlim = c(1,10)) +
+  theme(legend.position = "top", legend.justification = 'left', legend.title = element_text(face = "bold"))
+
+# Combine plots-----------------
+p6 <- grid.arrange(p3, p4, nrow=1)
+p <- grid.arrange(p1, p2, p6, nrow=3)
+
+ggsave("Fig3.jpg", plot=p, width=9, height=9)
+```
+
+
+############################################################
+### Figure 4. Fitted trends in mean platelet counts according to viremia levels – results from the supermodel
+```{r fig 4, echo=FALSE, message=TRUE, warning=TRUE}
+# Create new data for prediction
+nDF <- expand.grid(log10_vir = c(log10(60), log10(300), log10(600), 3.01, 3:10),
+                   cAge = c(-3,7),
+                   Sex = factor(c("Male","Female")),
+                   LM = c(1:7),
+                   DOI = c(1:10),
+                   Serotype = factor(c("DENV-1","DENV-2","DENV-3","DENV-4")),
+                   Serology = factor(c("Probable primary","Probable secondary","Indeterminate")),
+                   PCR = factor(c("Two-step", "One-step"))) %>%
+  mutate(log10_vir2 = log10_vir,
+         vir01 = ifelse(log10_vir<=3, 1, 0),
+         Serology = factor(Serology, levels = c("Probable secondary","Probable primary","Indeterminate")),
+         Age = cAge + 13,
+         LM_factor = as.factor(LM),
+         Sex = factor(Sex, levels = c("Male", "Female")),
+         PCR = factor(PCR, levels = c("Two-step", "One-step"))) %>%
+  filter(!(log10_vir<3 & PCR=="Two-step")) %>%
+  filter(!(log10_vir==log10(300) & !Serotype %in% c("DENV-1", "DENV-3"))) %>%
+  filter(!(log10_vir==log10(60) & !Serotype=="DENV-2")) %>%
+  filter(!(log10_vir==log10(600) & !Serotype=="DENV-4")) %>%
+  as.data.frame(.)
+
+DOI.labs <- c("Day 1", "Day 2", "Day 3", "Day 4", "Day 5", "Day 6", "Day 7", "Day 8", "Day 9", "Day 10")
+names(DOI.labs) <- c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10")
+LM.labs <- c("LM day 1", "LM day 2", "LM day 3", "LM day 4", "LM day 5", "LM day 6", "LM day 7")
+names(LM.labs) <- c("1", "2", "3", "4", "5", "6", "7")
+
+nDF1 <- nDF %>% filter(LM==1) %>% filter(DOI>=LM) %>% filter(log10_vir>=5 & log10_vir<=10)
+nDF2 <- nDF %>% filter(LM==2) %>% filter(DOI>=LM) %>% filter((log10_vir>=4 & log10_vir<=10))
+nDF3 <- nDF %>% filter(LM==3) %>% filter(DOI>=LM) %>% filter((log10_vir>=3 & log10_vir<=9) | log10_vir<=3)
+nDF4 <- nDF %>% filter(LM==4) %>% filter(DOI>=LM) %>% filter((log10_vir>=3 & log10_vir<=8) | log10_vir<=3)
+nDF5 <- nDF %>% filter(LM==5) %>% filter(DOI>=LM) %>% filter((log10_vir>=3 & log10_vir<=7) | log10_vir<=3)
+nDF6 <- nDF %>% filter(LM==6) %>% filter(DOI>=LM) %>% filter((log10_vir>=3 & log10_vir<=6) | log10_vir<=3)
+nDF7 <- nDF %>% filter(LM==7) %>% filter(DOI>=LM) %>% filter((log10_vir>=3 & log10_vir<=5) | log10_vir<=3) %>% 
+  filter(Serotype!="DENV-4")
+
+# Make prediction
+pmplm81 <- get_pred_lmer(mplm8, "PLT_sq", nDF1, "4root")
+pmplm82 <- get_pred_lmer(mplm8, "PLT_sq", nDF2, "4root")
+pmplm83 <- get_pred_lmer(mplm8, "PLT_sq", nDF3, "4root")
+pmplm84 <- get_pred_lmer(mplm8, "PLT_sq", nDF4, "4root")
+pmplm85 <- get_pred_lmer(mplm8, "PLT_sq", nDF5, "4root")
+pmplm86 <- get_pred_lmer(mplm8, "PLT_sq", nDF6, "4root")
+pmplm87 <- get_pred_lmer(mplm8, "PLT_sq", nDF7, "4root")
+pmplm8 <- bind_rows(pmplm81, pmplm82, pmplm83, pmplm84, pmplm85, pmplm86, pmplm87) %>% 
+  filter(!(log10_vir==3 & PCR=="One-step")) # to exclude the undetectable values setting as 1000, as this model used the LOD as LOD
+
+# Plot prediction for secondary infections
+pdat <- pmplm8 %>% 
+  filter(cAge==-3, Sex=="Male", Serology=="Probable secondary", PCR=="One-step") %>%
+  mutate(log10_vir = ifelse(log10_vir <= 3, 2, log10_vir))
+
+pb <- ggplot(data = filter(pdat, log10_vir > 2)) +
+  geom_ribbon(aes(x = log10_vir, ymin = low, ymax = upp, fill = Serotype), alpha = .2) +
+  geom_line(aes(x = log10_vir, y = pred, color = Serotype), alpha = .8, linewidth = .4) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(x = log10_vir, ymin = low, ymax = upp, color = Serotype), position = position_dodge(.5), width = .3, size = .4, alpha = 0.7) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(x = log10_vir, y = pred, color = Serotype), position = position_dodge(.5), size = .8, alpha = .95) +
+  labs(y = expression(paste("Platelet count (×", 10^{9}, "/L)", sep="")), x = "Viremia levels (log-10 copies/ml)") +
+  scale_x_continuous(breaks = c(2:10), labels = c("U", 3:10)) +
+  theme(legend.position = "top", legend.title = element_blank()) +
+  facet_grid(cols = vars(DOI), rows = vars(LM), labeller = labeller(DOI = DOI.labs, LM = LM.labs)) +
+  coord_cartesian(ylim = c(30,500))
+
+ggsave("Fig4.jpg", pb, width=12, height=7.5)
+```
+
+
+############################################################
+### Figure 5. Probability of occurrence of the two clinical endpoints according to viremia levels – results from the supermodel
+```{r fig 5, message=TRUE, warning=TRUE, include=FALSE}
+DOI.labs <- c("LM day 1", "LM day 2", "LM day 3", "LM day 4", "LM day 5", "LM day 6", "LM day 7")
+names(DOI.labs) <- c("1", "2", "3", "4", "5", "6", "7")
+
+# Severe dengue
+pdat <- pms1 %>%
+  filter(Age==10, Sex=="Male", Study=="22DX", Serology!="Indeterminate") %>% 
+  mutate(log10_vir = ifelse(log10_vir <= 3, 2, log10_vir),
+         Serology = factor(Serology, levels=c("Probable primary","Probable secondary")),
+         DOI = as.factor(DOI),
+         pred = ifelse(is.na(pred), 0, pred),
+         low = ifelse(is.na(low), 0, low),
+         upp = ifelse(is.na(upp), 0, upp))
+
+p1 <- ggplot(pdat, aes(x = log10_vir, y = pred)) +
+  geom_ribbon(data = filter(pdat, log10_vir>2), aes(ymin = low, ymax = upp, fill = Serology), alpha = .15) +
+  geom_line(data = filter(pdat, log10_vir>2), aes(color = Serology), alpha = .7) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(ymin = low, ymax = upp, color = Serology), width=.2, linewidth=.5, alpha=0.6, position = position_dodge(.6)) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(color = Serology), size = 1.2, position = position_dodge(.6)) +
+  labs(x = "Viremia levels (log-10 copies/ml)", subtitle = "(A) Probability of severe dengue") +
+  scale_x_continuous(breaks = 2:10, labels = c("U", 3:10)) +
+  scale_y_continuous(breaks = c(0:4)*.05, labels = c("0%","5%","10%","15%","20%")) +
+  scale_color_manual(values = c("blue","red")) +
+  scale_fill_manual(values = c("blue","red")) +
+  coord_cartesian(ylim = c(0, .23)) +
+  theme(axis.title.y=element_blank(), legend.position = "top", legend.title = element_blank()) +
+  facet_grid(rows = vars(Serotype), cols = vars(DOI), labeller = labeller(DOI = DOI.labs))
+
+# Plasma leakage
+pdat <- pml1 %>% 
+  filter(Age==10, Sex=="Male", Study=="22DX", Serology!="Indeterminate") %>% 
+  mutate(log10_vir = ifelse(log10_vir <= 3, 2, log10_vir),
+         Serology = factor(Serology, levels=c("Probable primary","Probable secondary")),
+         DOI = as.factor(DOI),
+         pred = ifelse(is.na(pred), 0, pred),
+         low = ifelse(is.na(low), 0, low),
+         upp = ifelse(is.na(upp), 0, upp))
+
+p2 <- ggplot(pdat, aes(x = log10_vir, y = pred)) +
+  geom_ribbon(data = filter(pdat, log10_vir>2), aes(ymin = low, ymax = upp, fill = Serology), alpha = .15) +
+  geom_line(data = filter(pdat, log10_vir>2), aes(color = Serology), alpha = .7) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(ymin = low, ymax = upp, color = Serology), width=.2, linewidth=.5, alpha=0.6, position = position_dodge(.6)) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(color = Serology), size = 1.2, position = position_dodge(.6)) +
+  labs(x = "Viremia levels (log-10 copies/ml)", subtitle = "(B) Probability of plasma leakage") +
+  scale_x_continuous(breaks = 2:10, labels = c("U", 3:10)) +
+  scale_y_continuous(breaks = c(0:4)*.1, labels = c("0%","10%","20%","30%","40%")) +
+  scale_color_manual(values = c("blue","red")) +
+  scale_fill_manual(values = c("blue","red")) +
+  coord_cartesian(ylim = c(0, .45)) +
+  theme(axis.title.y=element_blank(), legend.position = "top", legend.title = element_blank()) +
+  facet_grid(rows = vars(Serotype), cols = vars(DOI), labeller = labeller(DOI = DOI.labs))
+
+### Combine plots----------------------------------------------------------------
+library(ggpubr)
+p <- ggarrange(p1, p2, nrow=2, common.legend = T, legend = "top", label.x = "Viremia levels (log-10 copies/ml)")
+
+ggsave("Fig5.jpg", p, width=8, height=9)
+```
+
+
+############################################################
+### Figure 6. Probability of occurrence of the two clinical endpoints according to the rate of decline in viremia
+```{r fig 6, message=TRUE, warning=TRUE, include=FALSE}
+## Severe dengue
+dd <- datadist(dat_slope); options(datadist = "dd")
+ms3b <- lrm(Severe_dengue ~ Slope + Serotype + Serology + PCR, data=dat_slope)
+
+preds3b <- Predict(ms3b, Slope=c(18:36)*.05, Serotype=c("DENV-1","DENV-2","DENV-3","DENV-4"), Serology=c("Probable primary","Probable secondary"), PCR=c("One-step","Two-step"), fun=plogis) %>%
+  as.data.frame(.) %>%
+  filter(!(Serotype=="DENV-4" & PCR=="Two-step")) %>%
+  mutate(PCR = factor(PCR, levels=c("One-step","Two-step"), labels=c("One-step RT-PCR","Two-step RT-PCR")))
+
+p1 <- ggplot(preds3b, aes(Slope, yhat)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = Serology), alpha = .2) +
+  geom_line(aes(color = Serology), alpha = .7) +
+  theme(legend.position = "top", legend.title = element_blank(), axis.title.y = element_blank()) +
+  scale_x_continuous(breaks = c(1, 1.4, 1.8)) +
+  scale_y_continuous(breaks = c(0:3)*.1, labels = c("0%","10%","20%","30%")) +
+  scale_color_manual(values = c("blue","red")) +
+  scale_fill_manual(values = c("blue","red")) +
+  labs(x = "Rate of decline in viremia (log-10 copies/ml/day)", subtitle = "(A) Probability of severe dengue") +
+  facet_grid(cols = vars(Serotype), rows = vars(PCR)) +
+  coord_cartesian(ylim = c(0,.325))
+
+## Plasma leakage
+dd <- datadist(dat_slope); options(datadist = "dd")
+mp3b <- lrm(Leakage ~ Slope * (Serotype + Serology + PCR), data=dat_slope)
+
+predp3b <- Predict(mp3b, Slope=c(18:36)*.05, Serotype=c("DENV-1","DENV-2","DENV-3","DENV-4"), Serology=c("Probable primary","Probable secondary"), PCR=c("One-step","Two-step"), fun=plogis) %>% 
+  as.data.frame(.) %>%
+  filter(!(Serotype=="DENV-4" & PCR=="Two-step")) %>%
+  mutate(PCR = factor(PCR, levels=c("One-step","Two-step"), labels=c("One-step RT-PCR","Two-step RT-PCR")))
+
+p2 <- ggplot(predp3b, aes(Slope, yhat)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = Serology), alpha = .2) +
+  geom_line(aes(color = Serology), alpha = .7) +
+  theme(legend.position = "top", legend.title = element_blank(), axis.title.y = element_blank()) +
+  scale_x_continuous(breaks = c(1, 1.4, 1.8)) +
+  scale_y_continuous(breaks = c(0:3)*.2, labels = c("0%","20%","40%","60%")) +
+  scale_color_manual(values = c("blue","red")) +
+  scale_fill_manual(values = c("blue","red")) +
+  labs(x = "Rate of decline in viremia (log-10 copies/ml/day)", subtitle = "(B) Probability of plasma leakage") +
+  facet_grid(cols=vars(Serotype), rows=vars(PCR)) +
+  coord_cartesian(ylim = c(0, .65))
+
+## Combine results
+library(ggpubr)
+p <- ggarrange(p1, p2, nrow=2, common.legend = T, legend = "top")
+ggsave("Fig6.jpg", p, width=6, height=7)
+```
+

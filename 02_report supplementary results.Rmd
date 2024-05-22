@@ -1,0 +1,2290 @@
+---
+title: "VIREMIA KINETICS - Supplementary results"
+author: "Nguyen Lam Vuong"
+date: "22 May 2024"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r load packages, message=FALSE, warning=FALSE, include=FALSE}
+library(tidyverse)
+library(rms)
+library(lme4)
+library(MCMCglmm)
+library(DHARMa)
+library(geepack)
+library(gridExtra)
+library(gtsummary)
+
+theme_set(theme_bw())
+options(knitr.kable.NA = '')
+options(gtsummary.pvalue_fun = function(x) style_pvalue(x, digits = 3))
+options(gtsummary.tbl_summary.percent_fun = function(x) sprintf(x * 100, fmt='%.1f'))
+
+# Function to get prediction from linear mixed-effects model
+get_pred_lmer <- function(model, outcome, data, transform = "identical") {
+  datp <- data
+  text <- paste("datp$", outcome, " <- predict(model, datp, re.form=NA)", sep="")
+  fit <- eval(parse(text = text))
+  datp[[outcome]] <- fit
+  mm <- model.matrix(terms(model), datp)
+  mm <- mm[, colnames(mm) %in% names(fixef(model))] ## to deal with rank deficient
+  pvar <- diag(mm %*% tcrossprod(vcov(model), mm))
+  critval <- qnorm(0.975) ## approx 95% CI
+  lwr = fit - critval * sqrt(pvar)
+  upr = fit + critval * sqrt(pvar)
+  
+  if (transform == "4root") {
+    datp$pred <- fit^4; datp$low <- lwr^4; datp$upp <- upr^4
+  } else {
+    if (transform == "log2") {
+      datp$pred <- 2^fit; datp$low <- 2^lwr; datp$upp <- 2^upr
+    } else {
+      if (transform == "log10") {
+        datp$pred <- 10^fit; datp$low <- 10^lwr; datp$upp <- 10^upr
+      } else {
+        datp$pred <- fit; datp$low <- lwr; datp$upp <- upr
+      }
+    }
+  }
+  
+  return(datp)
+}
+
+# Function to modify coord_catesian for facet_grid
+# Thanks to Evan (https://gist.github.com/r2evans/6057f7995c117bb787495dc14a228d5d)
+coord_cartesian_panels <- function(..., panel_limits = NULL,
+                                   expand = TRUE, default = FALSE, clip = "on") {
+  if (is.null(panel_limits)) panel_limits <- tibble::tibble(...)
+  ggplot2::ggproto(NULL, UniquePanelCoords,
+                   panel_limits = panel_limits,
+                   expand = expand, default = default, clip = clip)
+}
+
+UniquePanelCoords <- ggplot2::ggproto(
+  "UniquePanelCoords", ggplot2::CoordCartesian,
+  
+  num_of_panels = 1,
+  panel_counter = 1,
+  layout = NULL,
+  
+  setup_layout = function(self, layout, params) {
+    self$num_of_panels <- length(unique(layout$PANEL))
+    self$panel_counter <- 1
+    self$layout <- layout # store for later
+    layout
+  },
+  
+  setup_panel_params =  function(self, scale_x, scale_y, params = list()) {
+    train_cartesian <- function(scale, limits, name, given_range = c(NA, NA)) {
+      if (anyNA(given_range)) {
+        expansion <- ggplot2:::default_expansion(scale, expand = self$expand)
+        range <- ggplot2:::expand_limits_scale(scale, expansion, coord_limits = limits)
+        isna <- is.na(given_range)
+        given_range[isna] <- range[isna]
+      }
+      # https://stackoverflow.com/a/75861761/3358272
+      if (scale$is_discrete()) limits <- scale$get_limits()
+      #
+      out <- list(
+        ggplot2:::view_scale_primary(scale, limits, given_range),
+        sec = ggplot2:::view_scale_secondary(scale, limits, given_range),
+        arrange = scale$axis_order(),
+        range = given_range
+      )
+      names(out) <- c(name, paste0(name, ".", names(out)[-1]))
+      out
+    }
+
+    this_layout <- self$layout[ self$panel_counter,, drop = FALSE ]
+    self$panel_counter <- 
+      if (self$panel_counter < self$num_of_panels) {
+        self$panel_counter + 1
+      } else 1
+
+    # determine merge column names by removing all "standard" names
+    layout_names <- setdiff(names(this_layout),
+                            c("PANEL", "ROW", "COL", "SCALE_X", "SCALE_Y"))
+    limits_names <- setdiff(names(self$panel_limits),
+                            c("xmin", "xmax", "ymin", "ymax"))
+
+    limits_extras <- setdiff(limits_names, layout_names)
+    if (length(limits_extras) > 0) {
+      stop("facet names in 'panel_limits' not found in 'layout': ",
+           paste(sQuote(limits_extras), collapse = ","))
+    } else if (length(limits_names) == 0 && NROW(self$panel_limits) == 1) {
+      # no panels in 'panel_limits'
+      this_panel_limits <- cbind(this_layout, self$panel_limits)
+    } else {
+      this_panel_limits <- merge(this_layout, self$panel_limits, all.x = TRUE, by = limits_names)
+    }
+
+    if (isTRUE(NROW(this_panel_limits) > 1)) {
+      stop("multiple matches for current panel in 'panel_limits'")
+    }
+
+    # add missing min/max columns, default to "no override" (NA)
+    this_panel_limits[, setdiff(c("xmin", "xmax", "ymin", "ymax"),
+                                names(this_panel_limits)) ] <- NA
+
+    c(train_cartesian(scale_x, self$limits$x, "x",
+                      unlist(this_panel_limits[, c("xmin", "xmax"), drop = TRUE])),
+      train_cartesian(scale_y, self$limits$y, "y",
+                      unlist(this_panel_limits[, c("ymin", "ymax"), drop = TRUE])))
+  }
+)
+```
+
+
+```{r load and merge data, message=FALSE, warning=FALSE, include=FALSE}
+load("Viremia model censored 240522.RData")
+load("Platelet landmark model 240522.RData")
+load("Viremia and outcomes 240522.RData")
+load("Data with viremia decline rate 240522.RData")
+
+# Full data-----------------------------------------------------------------------------
+dat <- read_csv("Longitudinal viremia and platelet 22May2024.csv") %>%
+  mutate(Study = factor(Study, levels = c("DR", "MD", "22DX")),
+         Sex = factor(Sex, levels = c("Male", "Female")),
+         Serotype = factor(Serotype, levels = c("DENV-1", "DENV-2", "DENV-3", "DENV-4", "Mixed", "Unknown")),
+         Serology = factor(Serology, levels = c("Probable primary", "Probable secondary", "Indeterminate")),
+         PLT_sq = PLT^(1/4),
+         cAge = Age - 13,
+         PCR = ifelse(Study == "22DX", 1, 0),
+         PCR = factor(PCR, levels = c(0,1), labels = c("Two-step", "One-step")),
+         vir_tmp = case_when(vir==0 & Serotype %in% c("DENV-1", "DENV-3") & PCR=="One-step" ~ 300,
+                             vir==0 & Serotype=="DENV-2" & PCR=="One-step" ~ 60,
+                             vir==0 & Serotype=="DENV-4" & PCR=="One-step" ~ 600,
+                             vir==0 & PCR=="Two-step" ~ 1000,
+                             vir>0 ~ vir),
+         vir_tmp = ifelse(vir<1000 & PCR=="Two-step", 1000, vir_tmp), # 63 values in the 2-step PCR cohort are <1000 but detectable --> set them to undetectable
+         vir01_original = ifelse(vir==0, 1, 0),
+         vir01 = ifelse(vir<1000 & PCR=="Two-step", 1, vir01_original),
+         log10_vir = log10(vir_tmp), 
+         vir_10root = vir_tmp^.1) %>%
+  select(Study, Code, Age, cAge, Sex, Enrol_DOI, Serotype, Serology, PCR, DOI, PLT, PLT_sq, 
+         log10_vir, vir_10root, vir01_original, vir01, Severe_dengue, doi_severe, Leakage, doi_leakage)
+
+
+# Data for summary-----------------------------------------------------------------------------
+## Data for viremia kinetics
+dat_vir <- dat %>%
+  filter(DOI<=10) %>% # most were undetectable before day 10
+  filter(!is.na(log10_vir)) %>%
+  filter(!is.na(Serotype) & !Serotype %in% c("Mixed","Unknown")) %>% # exclude patients with negative PCR
+  mutate(Serotype = factor(Serotype, levels=c("DENV-1","DENV-2","DENV-3","DENV-4")))
+
+## Platelet count kinetics
+dat_plt <- dat %>% 
+  filter(!is.na(PLT)) %>% 
+  filter(DOI<=14) %>%
+  filter(!is.na(Serotype) & !Serotype %in% c("Mixed","Unknown")) %>% # exclude patients with negative PCR
+  mutate(Serotype = factor(Serotype, levels=c("DENV-1","DENV-2","DENV-3","DENV-4")))
+
+## Clinical summary
+dat_plt_sum <- dat_plt %>% group_by(Code) %>% slice(1) %>% ungroup()
+dat_vir_sum <- dat_vir %>% group_by(Code) %>% slice(1) %>% ungroup()
+
+
+# Data for fitting model for PLT with viremia---------------------------------------------------
+dat2 <- dat %>%
+  filter(Serotype %in% c("DENV-1", "DENV-2", "DENV-3", "DENV-4")) %>%
+  mutate(Code = as.factor(Code),
+         Serotype = factor(Serotype, levels=c("DENV-1", "DENV-2", "DENV-3", "DENV-4")),
+         vir_LOD = vir01) %>%
+  group_by(Code) %>%
+  mutate(DOI_lag1 = lag(DOI),
+         log10_vir_lag1 = lag(log10_vir), # for lead viremia of 1 day
+         log10_vir1 = ifelse(DOI - DOI_lag1 == 1, log10_vir_lag1, NA),
+         vir_LOD1 = lag(vir_LOD),
+         vir_LOD1 = ifelse(DOI - DOI_lag1 == 1, vir_LOD1, NA),
+         
+         DOI_lag2 = lag(DOI_lag1),
+         log10_vir_lag2 = lag(log10_vir_lag1), # for lead viremia of 2 days
+         log10_vir2 = ifelse(DOI - DOI_lag2 == 2, log10_vir_lag2, NA),
+         vir_LOD2 = lag(vir_LOD1),
+         vir_LOD2 = ifelse(DOI - DOI_lag2 == 2, vir_LOD2, NA),
+         
+         DOI_lag3 = lag(DOI_lag2),
+         log10_vir_lag3 = lag(log10_vir_lag2), # for lead viremia of 3 days
+         log10_vir3 = ifelse(DOI - DOI_lag3 == 3, log10_vir_lag3, NA),
+         vir_LOD3 = lag(vir_LOD2),
+         vir_LOD3 = ifelse(DOI - DOI_lag3 == 3, vir_LOD3, NA),
+         
+         DOI_lag4 = lag(DOI_lag3),
+         log10_vir_lag4 = lag(log10_vir_lag3),
+         log10_vir4 = ifelse(DOI - DOI_lag4 == 4, log10_vir_lag4, NA),
+         vir_LOD4 = lag(vir_LOD3),
+         vir_LOD4 = ifelse(DOI - DOI_lag4 == 4, vir_LOD4, NA),
+         
+         DOI_lag5 = lag(DOI_lag4),
+         log10_vir_lag5 = lag(log10_vir_lag4),
+         log10_vir5 = ifelse(DOI - DOI_lag5 == 5, log10_vir_lag5, NA),
+         vir_LOD5 = lag(vir_LOD4),
+         vir_LOD5 = ifelse(DOI - DOI_lag5 == 5, vir_LOD5, NA)) %>%
+  ungroup()
+
+# Data censored at day 8
+dat3 <- dat2 %>% filter(DOI %in% c(1:8)) %>% filter(!is.na(PLT))
+dat3c <- dat3 %>% mutate(log10_vir = log10_vir1, vir_LOD = vir_LOD1) # data with lead viremia of 1 day
+dat3e <- dat3 %>% mutate(log10_vir = log10_vir2, vir_LOD = vir_LOD2) # data with lead viremia of 2 days
+
+# Data with available data of viremia, lag viremia of 1 and 2 days, and PLT
+dat4 <- dat2 %>% 
+  filter(!is.na(log10_vir) & !is.na(log10_vir1) & !is.na(log10_vir2) & !is.na(log10_vir3) & !is.na(PLT)) %>%
+  filter(DOI < 9) %>% # only 1 detectable viremia after day 8
+  mutate(dif1 = log10_vir - log10_vir1,
+         dif2 = log10_vir - log10_vir2,
+         dif3 = log10_vir - log10_vir3)
+
+# Data with available data of viremia, lag viremia of 1 - 5 days, and PLT
+dat5 <- dat2 %>% 
+  filter(!is.na(log10_vir) & !is.na(log10_vir1) & !is.na(log10_vir2) & !is.na(log10_vir3) & !is.na(log10_vir4) & !is.na(log10_vir5) & !is.na(PLT)) %>%
+  filter(DOI < 9) %>% # only 1 detectable viremia after day 8
+  mutate(dif1 = log10_vir - log10_vir1,
+         dif2 = log10_vir - log10_vir2,
+         dif3 = log10_vir - log10_vir3,
+         dif4 = log10_vir - log10_vir4,
+         dif5 = log10_vir - log10_vir5)
+
+
+# Data for landmark models for clinical outcomes-------------------------------------------------------
+dat1 <- dat_vir %>%
+  rename(Severe = Severe_dengue) %>%
+  mutate(doi_severe = ifelse(Severe == 0, 10, doi_severe),
+         doi_leakage = ifelse(is.na(doi_leakage) & Leakage == 1, 5, # Impute 5 for missing doi_leakage
+                              ifelse(Leakage == 0, 10, doi_leakage))) # Max DOI of severe patients is 7
+
+## Create landmark data, taking into account DOI of occurring severe dengue
+dats1 <- dat1 %>% filter(doi_severe >= 1) %>% filter(DOI == 1) %>% mutate(LM = 1)
+dats2 <- dat1 %>% filter(doi_severe >= 2) %>% filter(DOI == 2) %>% mutate(LM = 2)
+dats3 <- dat1 %>% filter(doi_severe >= 3) %>% filter(DOI == 3) %>% mutate(LM = 3)
+dats4 <- dat1 %>% filter(doi_severe >= 4) %>% filter(DOI == 4) %>% mutate(LM = 4)
+dats5 <- dat1 %>% filter(doi_severe >= 5) %>% filter(DOI == 5) %>% mutate(LM = 5)
+dats6 <- dat1 %>% filter(doi_severe >= 6) %>% filter(DOI == 6) %>% mutate(LM = 6)
+dats7 <- dat1 %>% filter(doi_severe >= 7) %>% filter(DOI == 7) %>% mutate(LM = 7)
+
+LMdats1 <- bind_rows(dats1, dats2, dats3, dats4, dats5, dats6, dats7) %>%
+  arrange(Code, LM) %>%
+  mutate(Code = factor(Code),
+         cLM = LM - 3,
+         clog10_vir = log10_vir - 6.38)
+
+## Create landmark data for plasma leakage
+datl1 <- dat1 %>% filter(doi_leakage >= 1) %>% filter(DOI == 1) %>% mutate(LM = 1)
+datl2 <- dat1 %>% filter(doi_leakage >= 2) %>% filter(DOI == 2) %>% mutate(LM = 2)
+datl3 <- dat1 %>% filter(doi_leakage >= 3) %>% filter(DOI == 3) %>% mutate(LM = 3)
+datl4 <- dat1 %>% filter(doi_leakage >= 4) %>% filter(DOI == 4) %>% mutate(LM = 4)
+datl5 <- dat1 %>% filter(doi_leakage >= 5) %>% filter(DOI == 5) %>% mutate(LM = 5)
+datl6 <- dat1 %>% filter(doi_leakage >= 6) %>% filter(DOI == 6) %>% mutate(LM = 6)
+datl7 <- dat1 %>% filter(doi_leakage >= 7) %>% filter(DOI == 7) %>% mutate(LM = 7)
+
+## Combine to landmark dataset
+LMdatl <- bind_rows(datl1, datl2, datl3, datl4, datl5, datl6, datl7) %>%
+  arrange(Code, LM) %>%
+  mutate(Code = factor(Code),
+         cLM = LM - 3,
+         clog10_vir = log10_vir - 6.38)
+
+# Data with viremia on day 3 and PLT count on days 4-7
+tmp_vir3 <- dat %>%
+  filter(DOI == 3) %>%
+  filter(!is.na(log10_vir)) %>%
+  select(Code, log10_vir, vir01)
+
+dat6 <- dat %>%
+  filter(DOI %in% c(3:8)) %>%
+  filter(!is.na(PLT)) %>%
+  filter(Serotype %in% c("DENV-1", "DENV-2", "DENV-3", "DENV-4")) %>%
+  select(Study, Code, PLT, PLT_sq, DOI, Age, cAge, Sex, Serotype, Serology, PCR) %>%
+  left_join(., tmp_vir3, by = "Code") %>%
+  mutate(Code = as.factor(Code),
+         Serotype = factor(Serotype, levels=c("DENV-1", "DENV-2", "DENV-3", "DENV-4")),
+         vir_LOD = factor(vir01, levels=c(0,1), labels=c("Detectable","Undetectable")),
+         Serology = relevel(Serology, ref="Probable secondary"))
+
+
+# Data for log-10 viremia-------------------------------------------------------------------------------
+dat_vir12 <- dat_vir %>%
+  filter(!(Serotype == "DENV-4" & PCR == "Two-step")) %>%
+  mutate(log10_vir_fake = ifelse(vir01==1, log10_vir-1, log10_vir),
+         ymax = log10_vir,
+         ymin = ifelse(vir01==1, -Inf, log10_vir)) %>%
+  as.data.frame(.)
+
+## Data for one-step PCR
+dat_vir1 <- dat_vir12 %>% filter(PCR == "One-step")
+
+## Data for two-step PCR
+dat_vir2 <- dat_vir12 %>% filter(PCR == "Two-step") %>% 
+  mutate(Serotype = factor(Serotype, levels=c("DENV-1", "DENV-2", "DENV-3")))
+
+
+# Data for 10th-root viremia model------------------------------------------------------------------------
+dat_vir12b <- dat_vir %>%
+  filter(!(Serotype == "DENV-4" & PCR == "Two-step")) %>%
+  mutate(vir_10root_fake = ifelse(vir01==1, vir_10root-1, vir_10root),
+         ymax = vir_10root,
+         ymin = ifelse(vir01==1, 0, vir_10root)) %>%
+  as.data.frame(.)
+
+## Data for one-step PCR
+dat_vir1b <- dat_vir12b %>% filter(PCR == "One-step")
+
+## Data for two-step PCR
+dat_vir2b <- dat_vir12b %>% filter(PCR == "Two-step") %>% 
+  mutate(Serotype = factor(Serotype, levels=c("DENV-1", "DENV-2", "DENV-3")))
+
+
+# Data for landmark model for platelet count------------------------------------------------------
+dat0 <- dat %>%
+  filter(DOI<=10) %>% # most were undetectable before day 10
+  filter(!is.na(log10_vir)) %>%
+  filter(!is.na(Serotype) & !Serotype %in% c("Mixed","Unknown")) %>% # exclude patients with negative PCR or mixed serotype
+  mutate(Code = as.factor(Code),
+         Serotype = factor(Serotype, levels=c("DENV-1","DENV-2","DENV-3","DENV-4")),
+         Serology = relevel(Serology, ref="Probable secondary"))
+
+dat_vir1 <- dat0 %>% filter(DOI==1) %>% select(Code, log10_vir, vir01)
+dat_vir2 <- dat0 %>% filter(DOI==2) %>% select(Code, log10_vir, vir01)
+dat_vir3 <- dat0 %>% filter(DOI==3) %>% select(Code, log10_vir, vir01)
+dat_vir4 <- dat0 %>% filter(DOI==4) %>% select(Code, log10_vir, vir01)
+dat_vir5 <- dat0 %>% filter(DOI==5) %>% select(Code, log10_vir, vir01)
+dat_vir6 <- dat0 %>% filter(DOI==6) %>% select(Code, log10_vir, vir01)
+dat_vir7 <- dat0 %>% filter(DOI==7) %>% select(Code, log10_vir, vir01)
+
+dat_lm0 <- dat0 %>% select(Study, Code, PLT, PLT_sq, DOI, Age, cAge, Sex, Serotype, Serology, PCR)
+
+dat_lm1 <- dat_lm0 %>% filter(DOI>=1) %>% filter(Code %in% dat_vir1$Code) %>% 
+  left_join(., dat_vir1, by="Code") %>% mutate(LM = 1)
+dat_lm2 <- dat_lm0 %>% filter(DOI>=2) %>% filter(Code %in% dat_vir2$Code) %>% 
+  left_join(., dat_vir2, by="Code") %>% mutate(LM = 2)
+dat_lm3 <- dat_lm0 %>% filter(DOI>=3) %>% filter(Code %in% dat_vir3$Code) %>% 
+  left_join(., dat_vir3, by="Code") %>% mutate(LM = 3)
+dat_lm4 <- dat_lm0 %>% filter(DOI>=4) %>% filter(Code %in% dat_vir4$Code) %>% 
+  left_join(., dat_vir4, by="Code") %>% mutate(LM = 4)
+dat_lm5 <- dat_lm0 %>% filter(DOI>=5) %>% filter(Code %in% dat_vir5$Code) %>% 
+  left_join(., dat_vir5, by="Code") %>% mutate(LM = 5)
+dat_lm6 <- dat_lm0 %>% filter(DOI>=6) %>% filter(Code %in% dat_vir6$Code) %>% 
+  left_join(., dat_vir6, by="Code") %>% mutate(LM = 6)
+dat_lm7 <- dat_lm0 %>% filter(DOI>=7) %>% filter(Code %in% dat_vir7$Code) %>% 
+  left_join(., dat_vir7, by="Code") %>% mutate(LM = 7)
+
+LMdat <- bind_rows(dat_lm1, dat_lm2, dat_lm3, dat_lm4, dat_lm5, dat_lm6, dat_lm7) %>% 
+  arrange(Code, LM, DOI) %>% 
+  filter(!is.na(PLT)) %>%
+  mutate(LM_factor = as.factor(LM))
+```
+
+
+############################################################
+### Appendix 3-figure 2. Empirical distribution estimation from the model for viremia kinetics
+```{r Appendix 3-figure 2, message=FALSE, warning=FALSE, include=FALSE}
+# Log-10 viremia
+tmp <- dat_vir12 %>% mutate(ymax = ifelse(log10_vir <= log10(1000), log10(1000), log10_vir))
+y <- tmp$ymax
+x_vals <- seq(min(y), max(y), length.out = 500)
+
+out1 <- simulate(m18, nsim = 100, acount_MLEs_var = TRUE, sandwich = TRUE)
+rep_y1 <- apply(out1, 2, function (x, x_vals) ecdf(x)(x_vals), x_vals = x_vals)
+sim_dat1 <- data.frame(id = 1:500, x = x_vals, as.data.frame(rep_y1)) %>%
+  tidyr::gather(., "y_dat", "y", 3:32) %>%
+  mutate(model = "model 1")
+
+ecdf_dat <- data.frame(id = 1:500, x = x_vals, y = ecdf(y)(x_vals), model = "edcf", y_dat = "edcf")
+
+sim_dat <- bind_rows(ecdf_dat, sim_dat1) %>%
+  mutate(model = factor(model, levels = c("edcf", "model 1"), labels = c("observed data", "replicated data")))
+
+p1 <- ggplot(sim_dat, aes(x, y, color = model, alpha = model)) +
+  geom_line(aes(group = y_dat), size = .4) +
+  geom_line(data = filter(sim_dat, model == "observed data"), aes(x=x, y=y, group = y_dat), color = "black") +
+  scale_color_manual(values = c("black", "grey")) +
+  scale_alpha_manual(values = c(1, .4)) +
+  scale_x_continuous(breaks = c(0:10)*2) +
+  labs(y = "Empirical cumulative distribution function", x = "Viremia level (log-10 copies/ml)", subtitle = "A - Model for log-10 viremia") +
+  theme_bw() +
+  theme(legend.position = c(.8, .2), legend.title = element_blank())
+
+# 10th-root viremia
+tmp <- dat_vir12b %>% mutate(ymax = ifelse(vir_10root <= 1000^.1, 1000^.1, vir_10root))
+y <- tmp$ymax
+x_vals <- seq(min(y), max(y), length.out = 500)
+
+out1 <- simulate(m18b, nsim = 100, acount_MLEs_var = TRUE, sandwich = TRUE)
+rep_y1 <- apply(out1, 2, function (x, x_vals) ecdf(x)(x_vals), x_vals = x_vals)
+sim_dat1 <- data.frame(id = 1:500, x = x_vals, as.data.frame(rep_y1)) %>%
+  tidyr::gather(., "y_dat", "y", 3:32) %>%
+  mutate(model = "model 1")
+
+ecdf_dat <- data.frame(id = 1:500, x = x_vals, y = ecdf(y)(x_vals), model = "edcf", y_dat = "edcf")
+
+sim_dat <- bind_rows(ecdf_dat, sim_dat1) %>%
+  mutate(model = factor(model, levels = c("edcf", "model 1"), labels = c("observed data", "replicated data")))
+
+p2 <- ggplot(sim_dat, aes(x, y, color = model, alpha = model)) +
+  geom_line(aes(group = y_dat), size = .4) +
+  geom_line(data = filter(sim_dat, model == "observed data"), aes(x=x, y=y, group = y_dat), color = "black") +
+  scale_color_manual(values = c("black", "grey")) +
+  scale_alpha_manual(values = c(1, .4)) +
+  scale_y_continuous(breaks = c(0:10)*.2) +
+  scale_x_continuous(breaks = c(0:20)*2) +
+  labs(y = "Empirical cumulative distribution function", x = "Viremia level (10th-root copies/ml)", subtitle = "B - Model for 10th-root viremia") +
+  theme_bw() +
+  theme(legend.position = c(.8, .2), legend.title = element_blank())
+
+# Combine plots
+p <- ggpubr::ggarrange(p1, p2, nrow=2)
+
+ggsave("A3_Fig2.jpg", plot=p, width=6, height=8)
+```
+
+
+############################################################
+### Appendix 3-table 1. Comparison of the models in analysis #2a
+```{r Appendix 3-table 1, echo=FALSE, message=FALSE, warning=FALSE}
+### Viremia on the same day
+m0 <- lmer(PLT_sq ~ rcs(cAge, 3) + Sex + Serotype + Serology + as.factor(DOI) + rcs(log10_vir, 3) + vir_LOD + PCR + as.factor(DOI) : (rcs(log10_vir, 3) + Serotype + Serology + rcs(cAge, 3) + Sex + PCR) + (Serotype + Serology):rcs(log10_vir, 3) + Serotype:Serology + (1|Code), REML=F, data=dat5)
+
+### Viremia 1 day earlier
+m1 <- lmer(PLT_sq ~ rcs(cAge, 3) + Sex + Serotype + Serology + as.factor(DOI) + rcs(log10_vir1, 3) + vir_LOD1 + PCR + as.factor(DOI) : (rcs(log10_vir1, 3) + Serotype + Serology + rcs(cAge, 3) + Sex + PCR) + (Serotype + Serology):rcs(log10_vir1, 3) + Serotype:Serology + (1|Code), REML=F, data=dat5)
+
+### Viremia 2 days earlier
+m2 <- lmer(PLT_sq ~ rcs(cAge, 3) + Sex + Serotype + Serology + as.factor(DOI) + rcs(log10_vir2, 3) + vir_LOD2 + PCR + as.factor(DOI) : (rcs(log10_vir2, 3) + Serotype + Serology + rcs(cAge, 3) + Sex + PCR) + (Serotype + Serology):rcs(log10_vir2, 3) + Serotype:Serology + (1|Code), REML=F, data=dat5)
+
+### Viremia 3 days earlier
+m3 <- lmer(PLT_sq ~ rcs(cAge, 3) + Sex + Serotype + Serology + as.factor(DOI) + rcs(log10_vir3, 3) + vir_LOD3 + PCR + as.factor(DOI) : (rcs(log10_vir3, 3) + Serotype + Serology + rcs(cAge, 3) + Sex + PCR) + (Serotype + Serology):rcs(log10_vir3, 3) + Serotype:Serology + (1|Code), REML=F, data=dat5)
+
+### Viremia 4 days earlier
+m4 <- lmer(PLT_sq ~ rcs(cAge, 3) + Sex + Serotype + Serology + as.factor(DOI) + rcs(log10_vir4, 3) + vir_LOD4 + PCR + as.factor(DOI) : (rcs(log10_vir4, 3) + Serotype + Serology + rcs(cAge, 3) + Sex + PCR) + (Serotype + Serology):rcs(log10_vir4, 3) + Serotype:Serology + (1|Code), REML=F, data=dat5)
+
+### Viremia 5 days earlier
+m5 <- lmer(PLT_sq ~ rcs(cAge, 3) + Sex + Serotype + Serology + as.factor(DOI) + rcs(log10_vir5, 3) + PCR + as.factor(DOI) : (rcs(log10_vir5, 3) + Serotype + Serology + rcs(cAge, 3) + Sex + PCR) + (Serotype + Serology):rcs(log10_vir5, 3) + Serotype:Serology + (1|Code), REML=F, data=dat5)
+
+tmp <- anova(m0, m1, m2, m3, m4, m5)
+Model <- c("Viremia 5 days earlier", "Viremia on the same day", "Viremia 1 day earlier", "Viremia 2 days earlier", "Viremia 3 days earlier", "Viremia 4 days earlier")
+res <- data.frame(Model, tmp[,1:4]) %>% arrange(desc(npar))
+res[,3:5] <- round(res[,3:5], 1)
+
+knitr::kable(res)
+```
+
+
+############################################################
+### Appendix 3-table 2. Comparison of the models in analysis #2b
+```{r Appendix 3-table 2, echo=FALSE, message=FALSE, warning=FALSE}
+## Day 2
+datd2 <- dat2 %>% filter(DOI==2 & !is.na(PLT_sq) & !is.na(log10_vir) & !is.na(log10_vir1))
+
+m0d2 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir, 3) + vir_LOD + PCR, data=datd2)
+m1d2 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir1, 3) + PCR, data=datd2)
+
+## Day 3
+datd3 <- dat2 %>% filter(DOI==3 & !is.na(PLT_sq) & !is.na(log10_vir) & !is.na(log10_vir1) & !is.na(log10_vir2))
+
+m0d3 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir, 3) + vir_LOD + PCR, data=datd3)
+m1d3 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir1, 3) + vir_LOD1 + PCR, data=datd3)
+m2d3 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir2, 3) + PCR, data=datd3)
+
+## Day 4
+datd4 <- dat2 %>% filter(DOI==4 & !is.na(PLT_sq) & !is.na(log10_vir) & !is.na(log10_vir1) & !is.na(log10_vir2) & !is.na(log10_vir3))
+
+m0d4 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir, 3) + vir_LOD + PCR, data=datd4)
+m1d4 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir1, 3) + vir_LOD1 + PCR, data=datd4)
+m2d4 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir2, 3) + vir_LOD2 + PCR, data=datd4)
+m3d4 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir3, 3) + PCR, data=datd4)
+
+## Day 5
+datd5 <- dat2 %>% filter(DOI==5 & !is.na(PLT_sq) & !is.na(log10_vir) & !is.na(log10_vir1) & !is.na(log10_vir2) & !is.na(log10_vir3) & !is.na(log10_vir4))
+
+m0d5 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir, 3) + vir_LOD + PCR, data=datd5)
+m1d5 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir1, 3) + vir_LOD1 + PCR, data=datd5)
+m2d5 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir2, 3) + vir_LOD2 + PCR, data=datd5)
+m3d5 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir3, 3) + vir_LOD3 + PCR, data=datd5)
+m4d5 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir4, 3) + PCR, data=datd5)
+
+## Day 6
+datd6 <- dat2 %>% filter(DOI==6 & !is.na(PLT_sq) & !is.na(log10_vir) & !is.na(log10_vir1) & !is.na(log10_vir2) & !is.na(log10_vir3) & !is.na(log10_vir4) & !is.na(log10_vir5))
+
+m0d6 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir, 3) + vir_LOD + PCR, data=datd6)
+m1d6 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir1, 3) + vir_LOD1 + PCR, data=datd6)
+m2d6 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir2, 3) + vir_LOD2 + PCR, data=datd6)
+m3d6 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir3, 3) + vir_LOD3 + PCR, data=datd6)
+m4d6 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir4, 3) + vir_LOD4 + PCR, data=datd6)
+m5d6 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir5, 3) + PCR, data=datd6)
+
+## Day 7
+datd7 <- dat2 %>% filter(DOI==7 & !is.na(PLT_sq) & !is.na(log10_vir) & !is.na(log10_vir1) & !is.na(log10_vir2) & !is.na(log10_vir3) & !is.na(log10_vir4) & !is.na(log10_vir5))
+
+m0d7 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir, 3) + vir_LOD + PCR, data=datd7)
+m1d7 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir1, 3) + vir_LOD1 + PCR, data=datd7)
+m2d7 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir2, 3) + vir_LOD2 + PCR, data=datd7)
+m3d7 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir3, 3) + vir_LOD3 + PCR, data=datd7)
+m4d7 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir4, 3) + vir_LOD4 + PCR, data=datd7)
+m5d7 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir5, 3) + PCR, data=datd7)
+
+## Day 8
+datd8 <- dat2 %>% filter(DOI==8 & !is.na(PLT_sq) & !is.na(log10_vir) & !is.na(log10_vir1) & !is.na(log10_vir2) & !is.na(log10_vir3) & !is.na(log10_vir4) & !is.na(log10_vir5))
+
+m0d8 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir, 3) + vir_LOD + PCR, data=datd8)
+m1d8 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + log10_vir1 + vir_LOD1 + PCR, data=datd8)
+m2d8 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir2, 3) + vir_LOD2 + PCR, data=datd8)
+m3d8 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir3, 3) + vir_LOD3 + PCR, data=datd8)
+m4d8 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir4, 3) + vir_LOD4 + PCR, data=datd8)
+m5d8 <- lm(PLT_sq ~ rcs(cAge, c(-6,0,15)) + Sex + Serotype + Serology + rcs(log10_vir5, 3) + PCR, data=datd8)
+
+## Function to get logLik and df
+get_ld <- function(model) {
+  ll <- logLik(model); ll <- sprintf("%.1f", round(ll,1))
+  df <- attributes(logLik(model))$df
+  aic <- AIC(model); aic <- round(aic,0)
+  result <- paste(ll, " (", aic, ")", sep="")
+  return(result)
+}
+
+day2 <- c(get_ld(m0d2), get_ld(m1d2), rep(NA, 4))
+day3 <- c(get_ld(m0d3), get_ld(m1d3), get_ld(m2d3), rep(NA, 3))
+day4 <- c(get_ld(m0d4), get_ld(m1d4), get_ld(m2d4), get_ld(m3d4), rep(NA, 2))
+day5 <- c(get_ld(m0d5), get_ld(m1d5), get_ld(m2d5), get_ld(m3d5), get_ld(m4d5), NA)
+day6 <- c(get_ld(m0d6), get_ld(m1d6), get_ld(m2d6), get_ld(m3d6), get_ld(m4d6), get_ld(m5d6))
+day7 <- c(get_ld(m0d7), get_ld(m1d7), get_ld(m2d7), get_ld(m3d7), get_ld(m4d7), get_ld(m5d7))
+day8 <- c(get_ld(m0d8), get_ld(m1d8), get_ld(m2d8), get_ld(m3d8), get_ld(m4d8), get_ld(m5d8))
+Model <- c("Same day", "1 day earlier", "2 days earlier", "3 days earlier", "4 days earlier", "5 days earlier")
+
+res <- data.frame(Model, day2, day3, day4, day5, day6, day7, day8)
+names(res) <- c("Model", "Day 2", "Day 3", "Day 4", "Day 5", "Day 6", "Day 7", "Day 8")
+knitr::kable(res)
+```
+
+
+############################################################
+### Appendix 3-figure 3. Empirical distribution estimation from the selected model for analysis #2c
+```{r Appendix 3-figure 3, message=FALSE, warning=FALSE, include=FALSE}
+y <- LMdat$PLT_sq
+x_vals <- seq(min(y), max(y), length.out = 500)
+
+out1 <- simulate(mplm8, nsim = 100, acount_MLEs_var = TRUE, sandwich = TRUE)
+ind1 <- out1 > sqrt(.Machine$double.eps)
+rep_y1 <- apply(out1, 2, function (x, x_vals) ecdf(x)(x_vals), x_vals = x_vals)
+sim_dat1 <- data.frame(id = 1:500, x = x_vals, as.data.frame(rep_y1)) %>%
+  tidyr::gather(., "y_dat", "y", 3:32) %>%
+  mutate(model = "model 1")
+
+ecdf_dat <- data.frame(id = 1:500, x = x_vals, y = ecdf(y)(x_vals), model = "edcf", y_dat = "edcf")
+
+sim_dat <- bind_rows(ecdf_dat, sim_dat1) %>%
+  mutate(model = factor(model, levels = c("edcf", "model 1"), labels = c("observed data", "replicated data")),
+         x = x^4)
+
+p <- ggplot(sim_dat, aes(x, y, color = model, alpha = model)) +
+  geom_line(aes(group = y_dat), size = .4) +
+  geom_line(data = filter(sim_dat, model == "observed data"), aes(x=x, y=y, group = y_dat), color = "black") +
+  scale_color_manual(values = c("black", "grey")) +
+  scale_alpha_manual(values = c(1, .4)) +
+  labs(y = "Empirical cumulative distribution function", x = expression(paste("Platelet count (×", 10^{9}, "/L)", sep=""))) +
+  theme_bw() +
+  theme(legend.position = c(.8, .2), legend.title = element_blank())
+
+ggsave("A3_Fig3.jpg", plot=p, width=6, height=4)
+```
+
+
+############################################################
+### Appendix 4-figure 1. Distribution of log-10 and 10th-root viremia levels by illness day
+```{r Appendix 4-figure 1, message=FALSE, warning=FALSE, include=FALSE}
+# Log-10
+tmp3 <- expand.grid(Serotype = as.factor(c("DENV-1","DENV-2","DENV-3","DENV-4")),
+                    Serology = as.factor(c("Probable primary","Probable secondary","Indeterminate")),
+                    PCR = as.factor(c("Two-step PCR","One-step PCR"))) %>%
+  filter(!(PCR=="Two-step" & Serotype=="DENV-4")) %>%
+  mutate(LOD = case_when(Serotype %in% c("DENV-1", "DENV-3") & PCR=="One-step PCR" ~ log10(300), 
+                         Serotype=="DENV-2" & PCR=="One-step PCR" ~ log10(60),
+                         Serotype=="DENV-4" & PCR=="One-step PCR" ~ log10(600),
+                         PCR=="Two-step PCR" ~ log10(1000)))
+
+dat_vir12_A4f1 <- dat_vir12 %>% mutate(PCR = factor(PCR, levels=c("One-step","Two-step"), labels=c("One-step PCR","Two-step PCR")))
+
+p1 <- ggplot(dat_vir12_A4f1, aes(as.factor(DOI), log10_vir_fake)) +
+  geom_hline(data = tmp3, aes(yintercept = LOD), size = .4, linetype = "dashed", alpha = .5) +
+  gghalves::geom_half_violin(side = "l", scale = "width", fill = "orange", alpha = .3) +
+  labs(y = "Viremia levels (log-10 copies/ml)", x = "Illness day", subtitle = "A - Log-10 transformation") +
+  scale_y_continuous(breaks = c(0:10)*2) +
+  facet_grid(rows = vars(Serotype), cols = vars(PCR), scales = "free_x") +
+  theme(plot.subtitle = element_text(face = "bold"))
+
+# 10th-root
+tmp3 <- expand.grid(Serotype = as.factor(c("DENV-1","DENV-2","DENV-3","DENV-4")),
+                    Serology = as.factor(c("Probable primary","Probable secondary","Indeterminate")),
+                    PCR = as.factor(c("Two-step PCR","One-step PCR"))) %>%
+  filter(!(PCR=="Two-step" & Serotype=="DENV-4")) %>%
+  mutate(LOD = case_when(Serotype %in% c("DENV-1", "DENV-3") & PCR=="One-step PCR" ~ 300^.1, 
+                         Serotype=="DENV-2" & PCR=="One-step PCR" ~ 60^.1,
+                         Serotype=="DENV-4" & PCR=="One-step PCR" ~ 600^.1,
+                         PCR=="Two-step PCR" ~ 1000^.1))
+
+dat_vir12b_A4f1 <- dat_vir12b %>% mutate(PCR = factor(PCR, levels=c("One-step","Two-step"), labels=c("One-step PCR","Two-step PCR")))
+
+p2 <- ggplot(dat_vir12b_A4f1, aes(as.factor(DOI), vir_10root_fake)) +
+  geom_hline(data = tmp3, aes(yintercept = LOD), size = .4, linetype = "dashed", alpha = .5) +
+  gghalves::geom_half_violin(side = "l", scale = "width", fill = "orange", alpha = .3) +
+  labs(y = "Viremia levels (10th-root copies/ml)", x = "Illness day", subtitle = "B - 10th-root transformation") +
+  scale_y_continuous(breaks = c(0:10)*2) +
+  facet_grid(rows = vars(Serotype), cols = vars(PCR), scales = "free_x") +
+  theme(plot.subtitle = element_text(face = "bold"))
+
+# Combine figures
+p <- grid.arrange(p1, p2, nrow = 2)
+ggsave("A4_Fig1.jpg", p, width = 8, height = 10)
+```
+
+
+############################################################
+### Appendix 4-figure 2. Distribution and individual trajectory of platelet count
+```{r Appendix 4-figure 2, message=FALSE, warning=FALSE, include=FALSE}
+# Distribution of platelet count
+p1 <- ggplot(dat_plt, aes(x = PLT)) +
+  geom_histogram(binwidth = 30, fill = "grey", color = "black", alpha = .5) +
+  labs(x = expression(paste("Platelet count (×", 10^{9}, "/L)", sep="")), y = "Number of patients", 
+       subtitle = "A - Distribution of platelet count") +
+  scale_x_continuous(breaks = c(0:10)*200) +
+  theme(plot.subtitle = element_text(face = "bold"))
+
+# Distribution of platelet count by illness day
+p2 <- ggplot(dat_plt, aes(as.factor(DOI), PLT)) +
+  geom_boxplot(alpha = .3, fill = "grey", width = 0.25, position = position_nudge(x=.2), outlier.size = 1) +
+  gghalves::geom_half_violin(side = "l", scale = "width", fill = "orange", alpha = .3) +
+  labs(y = expression(paste("Platelet count (×", 10^{9}, "/L)", sep="")), x = "Illness day", 
+       subtitle = "B - Distribution by illness day") +
+  theme(plot.subtitle = element_text(face = "bold"))
+
+# Platelet count
+p3 <- ggplot(dat_plt, aes(DOI, PLT, group = factor(Code))) +
+  geom_point(alpha = 0.5, color = "grey", size = 0.3) +
+  geom_line(alpha = 0.2, color = "black", size = 0.2) +
+  labs(y = expression(paste("Platelet count (×", 10^{9}, "/L)", sep="")), x = "Illness day", 
+       subtitle = "C - Individual trajectories of platelet count") +
+  scale_x_continuous(breaks = seq(0,20,2)) +
+  facet_grid(cols = vars(Serology), rows = vars(Serotype)) +
+  theme(plot.subtitle = element_text(face = "bold")) +
+  coord_cartesian(ylim = c(0, 600))
+
+# Combine plots
+p12 <- grid.arrange(p1, p2, ncol = 2, widths = c(1,1.3))
+p <- grid.arrange(p12, p3, nrow = 2, heights = c(1,2))
+
+ggsave("A4_Fig2.jpg", p, width = 7, height = 9)
+```
+
+
+############################################################
+### Appendix 4-table 1. Distribution of clinical outcomes by serotype and immune status
+```{r Appendix 4-table 1, echo=FALSE, message=FALSE, warning=FALSE}
+datS1 <- dat_vir_sum %>%
+  mutate(Severe_dengue = factor(Severe_dengue, levels=c(0,1), labels=c("No","Yes")),
+         Leakage = ifelse(is.na(Leakage), 2, Leakage),
+         Leakage = factor(Leakage, levels=c(0:2), labels=c("No","Yes","Indeterminate")))
+
+# Severe dengue
+ts0 <- datS1 %>%
+  select(Serotype, Severe_dengue) %>%
+  tbl_summary(by = Severe_dengue,
+              missing_text = "Missing",
+              statistic = list(all_categorical() ~ "{n} ({p})"),
+              percent = "row") %>%
+  modify_header(label = "", stat_by = "{level}\n(N={n})")
+
+ts1 <- datS1 %>%
+  filter(Serotype == "DENV-1") %>%
+  select(Serology, Severe_dengue) %>%
+  tbl_summary(by = Severe_dengue,
+              missing_text = "Missing",
+              statistic = list(all_categorical() ~ "{n} ({p})"),
+              label = list(Serology ~ "DENV-1"),
+              percent = "row") %>%
+  modify_header(label = "", stat_by = "{level}\n(N={n})")
+
+ts2 <- datS1 %>%
+  filter(Serotype == "DENV-2") %>%
+  select(Serology, Severe_dengue) %>%
+  tbl_summary(by = Severe_dengue,
+              missing_text = "Missing",
+              statistic = list(all_categorical() ~ "{n} ({p})"),
+              label = list(Serology ~ "DENV-2"),
+              percent = "row") %>%
+  modify_header(label = "", stat_by = "{level}\n(N={n})")
+
+ts3 <- datS1 %>%
+  filter(Serotype == "DENV-3") %>%
+  select(Serology, Severe_dengue) %>%
+  tbl_summary(by = Severe_dengue,
+              missing_text = "Missing",
+              statistic = list(all_categorical() ~ "{n} ({p})"),
+              label = list(Serology ~ "DENV-3"),
+              percent = "row") %>%
+  modify_header(label = "", stat_by = "{level}\n(N={n})")
+
+ts4 <- datS1 %>%
+  filter(Serotype == "DENV-4") %>%
+  select(Serology, Severe_dengue) %>%
+  tbl_summary(by = Severe_dengue,
+              missing_text = "Missing",
+              statistic = list(all_categorical() ~ "{n} ({p})"),
+              label = list(Serology ~ "DENV-4"),
+              percent = "row") %>%
+  modify_header(label = "", stat_by = "{level}\n(N={n})")
+
+ts <- tbl_stack(list(ts0, ts1, ts2, ts3, ts4))
+
+# Plasma leakage
+tl0 <- datS1 %>%
+  select(Serotype, Leakage) %>%
+  tbl_summary(by = Leakage,
+              #missing_text = "Missing",
+              statistic = list(all_categorical() ~ "{n} ({p})"),
+              percent = "row") %>%
+  modify_header(label = "", stat_by = "{level}\n(N={n})")
+
+tl1 <- datS1 %>%
+  filter(Serotype == "DENV-1") %>%
+  select(Serology, Leakage) %>%
+  tbl_summary(by = Leakage,
+              missing_text = "Missing",
+              statistic = list(all_categorical() ~ "{n} ({p})"),
+              label = list(Serology ~ "DENV-1"),
+              percent = "row") %>%
+  modify_header(label = "", stat_by = "{level}\n(N={n})")
+
+tl2 <- datS1 %>%
+  filter(Serotype == "DENV-2") %>%
+  select(Serology, Leakage) %>%
+  tbl_summary(by = Leakage,
+              missing_text = "Missing",
+              statistic = list(all_categorical() ~ "{n} ({p})"),
+              label = list(Serology ~ "DENV-2"),
+              percent = "row") %>%
+  modify_header(label = "", stat_by = "{level}\n(N={n})")
+
+tl3 <- datS1 %>%
+  filter(Serotype == "DENV-3") %>%
+  select(Serology, Leakage) %>%
+  tbl_summary(by = Leakage,
+              missing_text = "Missing",
+              statistic = list(all_categorical() ~ "{n} ({p})"),
+              label = list(Serology ~ "DENV-3"),
+              percent = "row") %>%
+  modify_header(label = "", stat_by = "{level}\n(N={n})")
+
+tl4 <- datS1 %>%
+  filter(Serotype == "DENV-4") %>%
+  select(Serology, Leakage) %>%
+  tbl_summary(by = Leakage,
+              missing_text = "Missing",
+              statistic = list(all_categorical() ~ "{n} ({p})"),
+              label = list(Serology ~ "DENV-4"),
+              percent = "row") %>%
+  modify_header(label = "", stat_by = "{level}\n(N={n})")
+
+tl <- tbl_stack(list(tl0, tl1, tl2, tl3, tl4))
+
+# Combine results
+tbl_merge(list(ts, tl), tab_spanner = c("Severe dengue", "Plasma leakage")) %>%
+  as_flextable(include = -footnote)
+```
+
+
+############################################################
+### Appendix 4-figure 3. Difference of log-10 viremia from the first measurement
+```{r Appendix 4-figure 3, echo=FALSE, message=FALSE, warning=FALSE}
+tmp_figs1 <- dat_vir12 %>%
+  group_by(Code) %>%
+  arrange(DOI) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(Code, log10_vir) %>%
+  rename(log10_vir0 = log10_vir)
+
+dat_figs1 <- left_join(dat_vir12, tmp_figs1, by = "Code") %>%
+  mutate(dif_vir = log10_vir - log10_vir0,
+         col_vir = ifelse(dif_vir > 0, 1, 0),
+         col_vir = factor(col_vir, levels = c(1,0), labels = c("Higher than the first measurement", "Lower than the first measurement")))
+
+dat_figs1a <- dat_figs1 %>% filter(PCR == "One-step")
+dat_figs1b <- dat_figs1 %>% filter(PCR == "Two-step") %>% mutate(Serotype = factor(Serotype, levels=c("DENV-1", "DENV-2", "DENV-3")))
+
+tmp0 <- expand.grid(DOI = c(1:10), 
+                    Serotype = c("DENV-1", "DENV-2", "DENV-3", "DENV-4"),
+                    Serology = c("Probable primary", "Probable secondary", "Indeterminate"),
+                    PCR = c("Two-step", "One-step")) %>%
+  mutate(Serotype = factor(Serotype, levels = c("DENV-1", "DENV-2", "DENV-3", "DENV-4")),
+         Serology = factor(Serology, levels = c("Probable primary", "Probable secondary", "Indeterminate")),
+         PCR = factor(PCR, levels=c("Two-step", "One-step")),
+         DOI = as.numeric(DOI))
+
+tmp1 <- dat_figs1 %>% filter(dif_vir>0) %>% group_by(DOI, Serotype, Serology, PCR) %>% summarise(n = n())
+tmp2 <- dat_figs1 %>% filter(dif_vir<=0) %>% group_by(DOI, Serotype, Serology, PCR) %>% summarise(n = n())
+
+tmp3 <- left_join(tmp0, tmp1, by = c("DOI", "Serotype", "Serology", "PCR")) %>% mutate(n = ifelse(is.na(n), 0, n))
+tmp3a <- tmp3 %>% filter(PCR == "One-step")
+tmp3b <- tmp3 %>% filter(PCR == "Two-step", Serotype != "DENV-4") %>% 
+  mutate(Serotype = factor(Serotype, levels=c("DENV-1", "DENV-2", "DENV-3")))
+
+tmp4 <- left_join(tmp0, tmp2, by = c("DOI", "Serotype", "Serology", "PCR")) %>% mutate(n = ifelse(is.na(n), 0, n))
+tmp4a <- tmp4 %>% filter(PCR == "One-step")
+tmp4b <- tmp4 %>% filter(PCR == "Two-step", Serotype != "DENV-4") %>% 
+  mutate(Serotype = factor(Serotype, levels=c("DENV-1", "DENV-2", "DENV-3")))
+
+# One-step PCR
+p1 <- ggplot(dat_figs1a, aes(DOI, dif_vir)) +
+  geom_hline(yintercept = 0, alpha = .5, color = "blue", size = 0.3) +
+  geom_line(aes(group = factor(Code)), alpha = 0.2, color = "black", size = 0.3) +
+  geom_point(alpha = 0.25, aes(color = col_vir), size = 0.4) +
+  annotate("text", x = .8, y = -8, label = "Number of patients:", size = 2.2, hjust = 0, vjust = 0) +
+  stat_summary(data = tmp3a, aes(x = DOI, y = -9, label = paste(n)), geom = "text", size = 2.2, hjust = 0.5, vjust = 0, color = "red") +
+  stat_summary(data = tmp4a, aes(x = DOI, y = -10, label = paste(n)), geom = "text", size = 2.2, hjust = 0.5, vjust = 0) +
+  labs(y = "Difference of viremia levels in log-10 copies/ml", x = "Illness day", subtitle = "A - One-step PCR cohort") +
+  scale_x_continuous(breaks = c(1:10)) +
+  scale_y_continuous(breaks = c(-4:10)*2) +
+  coord_cartesian(ylim = c(-10,3), xlim = c(1,8)) +
+  scale_color_manual(values = c("red", "black")) +
+  theme(legend.position = "none", plot.subtitle = element_text(face = "bold")) +
+  facet_grid(rows = vars(Serology), cols = vars(Serotype))
+
+# Two-step PCR
+p2 <- ggplot(dat_figs1b, aes(DOI, dif_vir)) +
+  geom_hline(yintercept = 0, alpha = .5, color = "blue", size = 0.3) +
+  geom_line(aes(group = factor(Code)), alpha = 0.2, color = "black", size = 0.3) +
+  geom_point(alpha = 0.25, aes(color = col_vir), size = 0.4) +
+  annotate("text", x = .8, y = -8, label = "Number of patients:", size = 2.2, hjust = 0, vjust = 0) +
+  stat_summary(data = tmp3b, aes(x = DOI, y = -9, label = paste(n)), geom = "text", size = 2.2, hjust = 0.5, vjust = 0, color = "red") +
+  stat_summary(data = tmp4b, aes(x = DOI, y = -10, label = paste(n)), geom = "text", size = 2.2, hjust = 0.5, vjust = 0) +
+  labs(y = "Difference of viremia levels in log-10 copies/ml", x = "Illness day", subtitle = "B - Two-step PCR cohort") +
+  scale_x_continuous(breaks = c(1:10)) +
+  scale_y_continuous(breaks = c(-4:10)*2) +
+  coord_cartesian(ylim = c(-10,3), xlim = c(1,10)) +
+  scale_color_manual(values = c("red", "black")) +
+  theme(legend.position = "none", plot.subtitle = element_text(face = "bold")) +
+  facet_grid(rows = vars(Serology), cols = vars(Serotype))
+
+## Combine plots
+p <- grid.arrange(p1, p2, nrow = 2)
+ggsave("A4_Fig3.jpg", p, width = 8, height = 10)
+```
+
+
+############################################################
+### Appendix 5-figure 1. Compare fitted trends in mean viremia levels between one-step and two-step PCR methods
+```{r Appendix 5-figure 1, message=TRUE, warning=TRUE, include=FALSE}
+tmp_lod1 <- expand.grid(Serotype = c("DENV-1","DENV-2","DENV-3","DENV-4"),
+                        Serology = c("Probable primary","Probable secondary","Indeterminate")) %>%
+  mutate(LOD = case_when(Serotype %in% c("DENV-1", "DENV-3") ~ log10(300), 
+                         Serotype=="DENV-2" ~ log10(60),
+                         Serotype=="DENV-4" ~ log10(600)),
+         Serology = factor(Serology, levels = c("Probable primary","Probable secondary","Indeterminate")),
+         PCR = "One-step PCR")
+
+tmp_lod2 <- expand.grid(Serotype = c("DENV-1","DENV-2","DENV-3"),
+                        Serology = c("Probable primary","Probable secondary","Indeterminate")) %>%
+  mutate(LOD = log10(1000),
+         Serology = factor(Serology, levels = c("Probable primary","Probable secondary","Indeterminate")),
+         PCR = "Two-step PCR")
+
+tmp_lod <- bind_rows(tmp_lod1, tmp_lod2) %>%
+  filter(Serotype != "DENV-4") %>%
+  mutate(PCR = factor(PCR, levels=c("One-step PCR","Two-step PCR")),
+         Serotype = factor(Serotype, levels=c("DENV-1","DENV-2","DENV-3")))
+
+## Data for prediction for left-censored model
+nDF <- expand.grid(cAge = c(-8,-3,2,7,17),
+                   Sex = as.factor(c("Male","Female")),
+                   DOI = c(10:105)*.1,
+                   Serotype = as.factor(c("DENV-1","DENV-2","DENV-3","DENV-4")),
+                   Serology = as.factor(c("Probable primary","Probable secondary","Indeterminate")),
+                   PCR = as.factor(c("Two-step", "One-step")),
+                   ymin = 0,
+                   ymax = 10,
+                   Code = unique(dat_vir12$Code)[1]) %>%
+  mutate(Serology = factor(Serology, levels=c("Probable primary","Probable secondary","Indeterminate")),
+         PCR = factor(PCR, levels=c("Two-step","One-step")),
+         Sex = factor(Sex, levels=c("Male", "Female")),
+         Code = as.character(Code)) %>%
+  filter(!(PCR=="Two-step" & Serotype=="DENV-4")) %>%
+  filter(!(PCR=="Two-step" & cAge %in% c(7, 17))) %>%
+  as.data.frame()
+
+pred18 <- predict(m18, newdata = nDF, interval = "confidence") %>% as.data.frame(.)
+
+pm <- bind_cols(nDF, pred18) %>%
+  filter(Serotype != "DENV-4") %>%
+  mutate(lod = ifelse((Serotype == "DENV-2" & fit < log10(60) & PCR == "One-step") |
+                        (Serotype == "DENV-4" & fit < log10(600) & PCR == "One-step") |
+                        (Serotype %in% c("DENV-1", "DENV-3") & fit < log10(300) & PCR == "One-step") |
+                        (fit < log10(1000) & PCR == "Two-step"), "<LOD", ">LOD"),
+         lod = factor(lod, levels = c(">LOD", "<LOD")),
+         PCR = factor(PCR, levels=c("One-step","Two-step"), labels=c("One-step PCR","Two-step PCR")),
+         Serotype = factor(Serotype, levels=c("DENV-1","DENV-2","DENV-3")))
+
+## Compare PCR
+p1 <- ggplot(data = filter(pm, cAge==-3, Sex=="Male")) +
+  geom_hline(data = tmp_lod, aes(yintercept = LOD, color = PCR), linetype = "solid", alpha = .8, size = .2) +
+  geom_ribbon(aes(x = DOI, ymin = lwr, ymax = upr, fill = PCR), alpha = .2) +
+  geom_line(aes(x = DOI, y = fit, color = PCR, linetype = lod), alpha = .8) +
+  labs(y = "Viremia levels (log-10 copies/ml)", x = "Illness day", subtitle = "A - Log-10 transformation") +
+  scale_x_continuous(breaks = c(1:10)*2) +
+  scale_y_continuous(breaks = c(0:10)*2) +
+  scale_linetype_discrete(guide = "none") +
+  theme(legend.position = "top", legend.title = element_blank(), plot.subtitle = element_text(face = "bold")) +
+  coord_cartesian(ylim = c(1.5,9), xlim = c(1,9)) +
+  facet_grid(cols = vars(Serology), rows = vars(Serotype))
+
+# Comparing PCR using model of 10th-root viremia--------------------------------------------------
+tmp_lod1 <- expand.grid(Serotype = c("DENV-1","DENV-2","DENV-3","DENV-4"),
+                        Serology = c("Probable primary","Probable secondary","Indeterminate")) %>%
+  mutate(LOD = case_when(Serotype %in% c("DENV-1", "DENV-3") ~ 300^.1, 
+                         Serotype=="DENV-2" ~ 60^.1,
+                         Serotype=="DENV-4" ~ 600^.1),
+         Serology = factor(Serology, levels = c("Probable primary","Probable secondary","Indeterminate")),
+         PCR = "One-step PCR")
+
+tmp_lod2 <- expand.grid(Serotype = c("DENV-1","DENV-2","DENV-3"),
+                        Serology = c("Probable primary","Probable secondary","Indeterminate")) %>%
+  mutate(LOD = 1000^.1,
+         Serology = factor(Serology, levels = c("Probable primary","Probable secondary","Indeterminate")),
+         PCR = "Two-step PCR")
+
+tmp_lod <- bind_rows(tmp_lod1, tmp_lod2) %>%
+  filter(Serotype != "DENV-4") %>%
+  mutate(PCR = factor(PCR, levels=c("One-step PCR","Two-step PCR")),
+         Serotype = factor(Serotype, levels=c("DENV-1","DENV-2","DENV-3")))
+
+## Data for prediction for left-censored model
+nDF <- expand.grid(cAge = c(-8,-3,2,7,17),
+                   Sex = as.factor(c("Male","Female")),
+                   DOI = c(10:105)*.1,
+                   Serotype = as.factor(c("DENV-1","DENV-2","DENV-3","DENV-4")),
+                   Serology = as.factor(c("Probable primary","Probable secondary","Indeterminate")),
+                   PCR = as.factor(c("Two-step", "One-step")),
+                   ymin = 0,
+                   ymax = 10,
+                   Code = unique(dat_vir12$Code)[1]) %>%
+  mutate(Serology = factor(Serology, levels=c("Probable primary","Probable secondary","Indeterminate")),
+         PCR = factor(PCR, levels=c("Two-step","One-step")),
+         Sex = factor(Sex, levels=c("Male", "Female")),
+         Code = as.character(Code)) %>%
+  filter(!(PCR=="Two-step" & Serotype=="DENV-4")) %>%
+  filter(!(PCR=="Two-step" & cAge %in% c(7, 17))) %>%
+  as.data.frame()
+
+pred18b <- predict(m18b, newdata = nDF, interval = "confidence") %>% as.data.frame(.)
+
+pm <- bind_cols(nDF, pred18b) %>%
+  filter(Serotype != "DENV-4") %>%
+  mutate(lod = ifelse((Serotype == "DENV-2" & fit < 60^.1 & PCR == "One-step") |
+                        (Serotype == "DENV-4" & fit < 600^.1 & PCR == "One-step") |
+                        (Serotype %in% c("DENV-1", "DENV-3") & fit < 300^.1 & PCR == "One-step") |
+                        (fit < 1000^.1 & PCR == "Two-step"), "<LOD", ">LOD"),
+         lod = factor(lod, levels = c(">LOD", "<LOD")),
+         PCR = factor(PCR, levels=c("One-step","Two-step"), labels=c("One-step PCR","Two-step PCR")),
+         Serotype = factor(Serotype, levels=c("DENV-1","DENV-2","DENV-3")))
+
+## Compare PCR
+p2 <- ggplot(data = filter(pm, cAge==-3, Sex=="Male")) +
+  geom_hline(data = tmp_lod, aes(yintercept = LOD, color = PCR), linetype = "solid", alpha = .8, size = .2) +
+  geom_ribbon(aes(x = DOI, ymin = lwr, ymax = upr, fill = PCR), alpha = .2) +
+  geom_line(aes(x = DOI, y = fit, color = PCR, linetype = lod), alpha = .8) +
+  labs(y = "Viremia levels (10th-root copies/ml)", x = "Illness day", subtitle = "B - 10th-root transformation") +
+  scale_x_continuous(breaks = c(1:10)*2) +
+  scale_y_continuous(breaks = c(0:10)*1) +
+  scale_linetype_discrete(guide = "none") +
+  theme(legend.position = "top", legend.title = element_blank(), plot.subtitle = element_text(face = "bold")) +
+  coord_cartesian(ylim = c(1.5,7), xlim = c(1,9)) +
+  facet_grid(cols = vars(Serology), rows = vars(Serotype))
+
+# Combine results----------------------------------------
+library(ggpubr)
+p <- ggarrange(p1, p2, nrow=2, common.legend = T, legend = "top")
+
+ggsave("A5_Fig1.jpg", p, width=8, height=10)
+```
+
+
+############################################################
+### Appendix 5-table 1. P values of parameters in the models of viremia kinetics
+```{r Appendix 5-table 1, echo=FALSE, message=FALSE, warning=FALSE}
+library(aod)
+
+vc1 <- cov(m18$Sol)
+b1 <- colMeans(m18$Sol)
+tmp <- data.frame(para = colnames(m18$Sol), num = 1:length(colnames(m18$Sol)))
+
+age <- tmp$num[grepl("cAge", tmp$para)]
+age_inter <- tmp$num[grepl("cAge", tmp$para) & grepl(":", tmp$para)]
+age_spline <- tmp$num[grepl("cAge'", tmp$para)]
+sex <- tmp$num[grepl("Sex", tmp$para)]
+sex_inter <- tmp$num[grepl("Sex", tmp$para) & grepl(":", tmp$para)]
+serotype <- tmp$num[grepl("Serotype", tmp$para)]
+serotype_inter <- tmp$num[grepl("Serotype", tmp$para) & grepl(":", tmp$para)]
+serology <- tmp$num[grepl("Serology", tmp$para)]
+serology_inter <- tmp$num[grepl("Serology", tmp$para) & grepl(":", tmp$para)]
+PCR <- tmp$num[grepl("PCR", tmp$para)]
+PCR_inter <- tmp$num[grepl("PCR", tmp$para) & grepl(":", tmp$para)]
+DOI <- tmp$num[grepl("DOI", tmp$para)]
+DOI_inter <- tmp$num[grepl("DOI", tmp$para) & grepl(":", tmp$para)]
+DOI_spline <- tmp$num[grepl("DOI'", tmp$para)]
+serotype_serology <- tmp$num[grepl("Serotype", tmp$para) & grepl("Serology", tmp$para)]
+age_DOI <- tmp$num[grepl("cAge", tmp$para) & grepl("DOI", tmp$para)]
+sex_DOI <- tmp$num[grepl("Sex", tmp$para) & grepl("DOI", tmp$para)]
+serotype_DOI <- tmp$num[grepl("Serotype", tmp$para) & grepl("DOI", tmp$para)]
+serology_DOI <- tmp$num[grepl("Serology", tmp$para) & grepl("DOI", tmp$para)]
+PCR_DOI <- tmp$num[grepl("PCR", tmp$para) & grepl("DOI", tmp$para)]
+
+p1 <- c(
+  wald.test(b=b1, Sigma=vc1, Terms=age)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=age_inter)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=age_spline)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=sex)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=sex_inter)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=serotype)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=serotype_inter)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=serology)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=serology_inter)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=PCR)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=PCR_inter)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=DOI)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=DOI_inter)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=DOI_spline)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=serotype_serology)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=age_DOI)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=sex_DOI)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=serotype_DOI)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=serology_DOI)$result$chi2[3],
+  wald.test(b=b1, Sigma=vc1, Terms=PCR_DOI)$result$chi2[3]
+)
+
+t2 <- data.frame(p = p1) %>%
+  mutate(Parameter = c("Age (overall effect)", "- All interactions of Age", "- Nonlinear effect of Age", 
+                       "Sex (overall effect)", "- All interactions of Sex", 
+                       "Serotype (overall effect)", "- All interactions of Serotype", 
+                       "Immune status (overall effect)", "- All interactions of Immune status", 
+                       "PCR method (overall effect)", "- All interactions of PCR method", 
+                       "Day (overall effect)", "- All interactions of Day", "- Nonlinear effect of Day",
+                       "Serotype * Immune status", "Age * Day", "Sex * Day",
+                       "Serotype * Day", "Immune status * Day", "PCR * Day"),
+         p = ifelse(p < 0.0001, "<0.0001", sprintf("%.4f", round(p, 4)))) %>%
+  select(Parameter, p)
+
+knitr::kable(t2)
+```
+
+
+############################################################
+### Appendix 5-figure 2. Fitted trends in mean viremia levels by models based on 10th-root and log-10 viremia transformations
+```{r Appendix 5-figure 2, message=TRUE, warning=TRUE, include=FALSE}
+# Data for prediction for left-censored model
+nDF <- expand.grid(cAge = c(-8,-3,2,7,17),
+                   Sex = as.factor(c("Male","Female")),
+                   DOI = c(10:105)*.1,
+                   Serotype = as.factor(c("DENV-1","DENV-2","DENV-3","DENV-4")),
+                   Serology = as.factor(c("Probable primary","Probable secondary","Indeterminate")),
+                   PCR = as.factor(c("Two-step", "One-step")),
+                   ymin = 0,
+                   ymax = 10,
+                   Code = unique(dat_vir12$Code)[1]) %>%
+  mutate(Serology = factor(Serology, levels=c("Probable primary","Probable secondary","Indeterminate")),
+         PCR = factor(PCR, levels=c("Two-step","One-step")),
+         Sex = factor(Sex, levels=c("Male", "Female")),
+         Code = as.character(Code)) %>%
+  filter(!(PCR=="Two-step" & Serotype=="DENV-4")) %>%
+  filter(!(PCR=="Two-step" & cAge %in% c(7, 17))) %>%
+  as.data.frame()
+
+# For log-10 viremia-----------------------------------
+## Data for plot LOD
+tmp_lod1 <- expand.grid(Serotype = c("DENV-1","DENV-2","DENV-3","DENV-4"),
+                        Serology = c("Probable primary","Probable secondary","Indeterminate")) %>%
+  mutate(LOD = ifelse(Serotype == "DENV-2", log10(60), 
+                      ifelse(Serotype == "DENV-4", log10(600),
+                             ifelse(Serotype == "DENV-1", log10(300), log10(300)))),
+         Serology = factor(Serology, levels = c("Probable primary","Probable secondary","Indeterminate")))
+
+tmp_lod2 <- expand.grid(Serotype = c("DENV-1","DENV-2","DENV-3"),
+                        Serology = c("Probable primary","Probable secondary","Indeterminate")) %>%
+  mutate(LOD = log10(1000),
+         Serology = factor(Serology, levels = c("Probable primary","Probable secondary","Indeterminate")))
+
+## Prediction
+pred18 <- predict(m18, newdata = nDF, interval = "confidence") %>% as.data.frame(.)
+pm18 <- bind_cols(nDF, pred18) %>% mutate(model = "Model using log-10 viremia")
+
+pred18b <- predict(m18b, newdata = nDF, interval = "confidence") %>% as.data.frame(.)
+pm18b <- bind_cols(nDF, pred18b) %>% 
+  mutate(model = "Model using 10th-root viremia",
+         fit = ifelse(fit<0, 0, fit),
+         lwr = ifelse(lwr<0, 0, lwr),
+         upr = ifelse(upr<0, 0, upr),
+         fit = log10(fit^10),
+         lwr = log10(lwr^10),
+         upr = log10(upr^10))
+
+pm <- bind_rows(pm18, pm18b) %>%
+  mutate(lod = ifelse((Serotype == "DENV-2" & fit < log10(60) & PCR == "One-step") |
+                        (Serotype == "DENV-4" & fit < log10(600) & PCR == "One-step") |
+                        (Serotype %in% c("DENV-1", "DENV-3") & fit < log10(300) & PCR == "One-step") |
+                        (fit < log10(1000) & PCR == "Two-step"), "<LOD", ">LOD"),
+         lod = factor(lod, levels = c(">LOD", "<LOD")))
+
+pm1 <- pm %>% filter(PCR=="One-step")
+
+pm2 <- pm %>% filter(PCR=="Two-step") %>%
+  mutate(Serotype = factor(Serotype, levels=c("DENV-1","DENV-2","DENV-3")))
+
+# Plot---------------------------------------
+## One-step PCR
+p1 <- ggplot(data = filter(pm1, cAge==-3, Sex=="Male")) +
+  geom_hline(data = tmp_lod1, aes(yintercept = LOD), linetype = "solid", alpha = .8, size = .2) +
+  geom_ribbon(aes(x = DOI, ymin = lwr, ymax = upr, fill = model), alpha = .2) +
+  geom_line(aes(x = DOI, y = fit, color = model, linetype = lod), alpha = .8) +
+  labs(y = "Viremia levels (log-10 copies/ml)", x = "Illness day", subtitle = "A - One-step PCR") +
+  scale_x_continuous(breaks = c(1:10)*2) +
+  scale_y_continuous(breaks = c(0:10)*2) +
+  scale_linetype_discrete(guide = "none") +
+  theme(legend.position = "top", legend.title = element_blank(), plot.subtitle = element_text(face = "bold")) +
+  coord_cartesian(ylim = c(1,9), xlim = c(1,10)) +
+  facet_grid(rows = vars(Serology), cols = vars(Serotype))
+
+## Two-step PCR
+p2 <- ggplot(data = filter(pm2, cAge==-3, Sex=="Male")) +
+  geom_hline(data = tmp_lod2, aes(yintercept = LOD), linetype = "solid", alpha = .8, size = .2) +
+  geom_ribbon(aes(x = DOI, ymin = lwr, ymax = upr, fill = model), alpha = .2) +
+  geom_line(aes(x = DOI, y = fit, color = model, linetype = lod), alpha = .8) +
+  labs(y = "Viremia levels (log-10 copies/ml)", x = "Illness day", subtitle = "B - Two-step PCR") +
+  scale_x_continuous(breaks = c(1:10)) +
+  scale_y_continuous(breaks = c(0:10)*2) +
+  scale_linetype_discrete(guide = "none") +
+  theme(legend.position = "top", legend.title = element_blank(), plot.subtitle = element_text(face = "bold")) +
+  coord_cartesian(ylim = c(2,9), xlim = c(1,7)) +
+  facet_grid(rows = vars(Serology), cols = vars(Serotype))
+
+## Combine plots
+p <- ggpubr::ggarrange(p1, p2, nrow=2, common.legend = TRUE, legend="top")
+ggsave("A5_Fig2.jpg", plot=p, width=8, height=9.5)
+```
+
+
+############################################################
+### Appendix 6-table 1. P values of parameters in the supermodel for platelet count
+```{r Appendix 6-table 1, echo=FALSE, message=FALSE, warning=FALSE}
+# Model without PCR---------------------------------------------------------------
+# Get model estimates
+m <- mplm8
+
+# Wald test for each parameter
+vc <- vcov(m, useScale = FALSE)
+b <- fixef(m)
+
+tmp <- data.frame(para = names(b), num = 1:length(names(b)))
+
+age <- tmp$num[grepl("cAge", tmp$para)]
+age_inter <- tmp$num[grepl("cAge", tmp$para) & grepl(":", tmp$para)]
+age_spline <- tmp$num[grepl("cAge'", tmp$para)]
+sex <- tmp$num[grepl("Sex", tmp$para)]
+sex_inter <- tmp$num[grepl("Sex", tmp$para) & grepl(":", tmp$para)]
+serotype <- tmp$num[grepl("Serotype", tmp$para)]
+serotype_inter <- tmp$num[grepl("Serotype", tmp$para) & grepl(":", tmp$para)]
+serology <- tmp$num[grepl("Serology", tmp$para)]
+serology_inter <- tmp$num[grepl("Serology", tmp$para) & grepl(":", tmp$para)]
+PCR <- tmp$num[grepl("PCR", tmp$para)]
+PCR_inter <- tmp$num[grepl("PCR", tmp$para) & grepl(":", tmp$para)]
+DOI <- tmp$num[grepl("DOI", tmp$para)]
+DOI_inter <- tmp$num[grepl("DOI", tmp$para) & grepl(":", tmp$para)]
+DOI_spline <- tmp$num[grepl("DOI'", tmp$para)]
+LM <- tmp$num[grepl("LM", tmp$para)]
+LM_inter <- tmp$num[grepl("LM", tmp$para) & grepl(":", tmp$para)]
+LM_spline <- tmp$num[grepl("LM'", tmp$para)]
+
+vir <- tmp$num[grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)]
+vir_inter <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl(":", tmp$para)]
+vir_spline <- tmp$num[grepl("log10_vir'", tmp$para)]
+vir01 <- tmp$num[grepl("vir01", tmp$para)]
+
+age_DOI <- tmp$num[grepl("cAge", tmp$para) & grepl("DOI", tmp$para)]
+sex_DOI <- tmp$num[grepl("Sex", tmp$para) & grepl("DOI", tmp$para)]
+serotype_DOI <- tmp$num[grepl("Serotype", tmp$para) & grepl("DOI", tmp$para)]
+serology_DOI <- tmp$num[grepl("Serology", tmp$para) & grepl("DOI", tmp$para)]
+PCR_DOI <- tmp$num[grepl("PCR", tmp$para) & grepl("DOI", tmp$para)]
+LM_DOI <- tmp$num[grepl("LM", tmp$para) & grepl("DOI", tmp$para)]
+vir_DOI <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("DOI", tmp$para)]
+
+#vir_age <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("cAge", tmp$para)]
+#vir_sex <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Sex", tmp$para)]
+vir_serotype <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para)]
+vir_serology <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serology", tmp$para)]
+vir_PCR <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("PCR", tmp$para)]
+
+vir_LM <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("LM", tmp$para)]
+serotype_LM <- tmp$num[grepl("Serotype", tmp$para) & grepl("LM", tmp$para)]
+PCR_LM <- tmp$num[grepl("PCR", tmp$para) & grepl("LM", tmp$para)]
+serotype_PCR <- tmp$num[grepl("Serotype", tmp$para) & grepl("PCR", tmp$para)]
+serotype_serology <- tmp$num[grepl("Serotype", tmp$para) & grepl("Serology", tmp$para)]
+
+vir_serotype_PCR <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para) & grepl("PCR", tmp$para)]
+vir_serotype_DOI <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para) & grepl("DOI", tmp$para)]
+vir_DOI_PCR <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("DOI", tmp$para) & grepl("PCR", tmp$para)]
+vir_serotype_LM <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para) & grepl("LM", tmp$para)]
+vir_PCR_LM <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("PCR", tmp$para) & grepl("LM", tmp$para)]
+vir_serotype_serology <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para) & grepl("Serology", tmp$para)]
+
+serotype_PCR_DOI <- tmp$num[grepl("Serotype", tmp$para) & grepl("PCR", tmp$para) & grepl("DOI", tmp$para)]
+serotype_PCR_LM <- tmp$num[grepl("Serotype", tmp$para) & grepl("PCR", tmp$para) & grepl("LM", tmp$para)]
+
+vir_serotype_PCR_DOI <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para) & grepl("PCR", tmp$para) & grepl("DOI", tmp$para)]
+vir_serotype_PCR_LM <- tmp$num[(grepl("log10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para) & grepl("PCR", tmp$para) & grepl("LM", tmp$para)]
+
+library(aod)
+p1 <- c(
+  wald.test(b=b, Sigma=vc, Terms=age)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=age_inter)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=age_spline)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=sex)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=sex_inter)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=serotype)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=serotype_inter)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=serology)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=serology_inter)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=PCR)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=PCR_inter)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=DOI)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=DOI_inter)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=DOI_spline)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=LM)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=LM_inter)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=LM_spline)$result$chi2[3],
+  
+  wald.test(b=b, Sigma=vc, Terms=vir)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir_inter)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir_spline)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir01)$result$chi2[3],
+  
+  wald.test(b=b, Sigma=vc, Terms=age_DOI)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=sex_DOI)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=serotype_DOI)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=serology_DOI)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=PCR_DOI)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=LM_DOI)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir_DOI)$result$chi2[3],
+  
+  #wald.test(b=b, Sigma=vc, Terms=vir_age)$result$chi2[3],
+  #wald.test(b=b, Sigma=vc, Terms=vir_sex)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir_serotype)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir_serology)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir_PCR)$result$chi2[3],
+  
+  wald.test(b=b, Sigma=vc, Terms=vir_LM)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=serotype_LM)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=PCR_LM)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=serotype_PCR)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=serotype_serology)$result$chi2[3],
+  
+  wald.test(b=b, Sigma=vc, Terms=vir_serotype_PCR)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir_serotype_DOI)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir_DOI_PCR)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir_serotype_LM)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir_PCR_LM)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir_serotype_serology)$result$chi2[3],
+  
+  wald.test(b=b, Sigma=vc, Terms=serotype_PCR_DOI)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=serotype_PCR_LM)$result$chi2[3],
+  
+  wald.test(b=b, Sigma=vc, Terms=vir_serotype_PCR_DOI)$result$chi2[3],
+  wald.test(b=b, Sigma=vc, Terms=vir_serotype_PCR_LM)$result$chi2[3]
+)
+
+t2 <- data.frame(p = p1) %>%
+  mutate(Parameter = c("Age (overall effect)", "- All interactions of Age", "- Nonlinear effect of Age", 
+                       "Sex (overall effect)", "- All interactions of Sex", 
+                       "Serotype (overall effect)", "- All interactions of Serotype", 
+                       "Immune status (overall effect)", "- All interactions of Immune status", 
+                       "PCR method (overall effect)", "- All interactions of PCR method", 
+                       "Day (overall effect)", "- All interactions of Day", "- Nonlinear effect of Day",
+                       "Landmark (overall effect)", "- All interactions of Landmark", "- Nonlinear effect of Landmark",
+                       
+                       "Viremia (overall effect)", "- All interactions of Viremia", "- Nonlinear effect of Viremia",
+                       "- Undetectable Viremia",
+                       
+                       "Age * Day", "Sex * Day", "Serotype * Day", "Immune status * Day", "PCR * Day", "Landmark * Day",
+                       "Viremia * Day", "Viremia * Serotype", "Viremia * Immune status", "Viremia * PCR",
+                       "Viremia * Landmark", "Serotype * Landmark", "PCR * Landmark", 
+                       "Serotype * PCR", "Serotype * Immune status",
+                       
+                       "Viremia * Serotype * PCR", "Viremia * Serotype * Day", "Viremia * PCR * Day",
+                       "Viremia * Serotype * Landmark", "Viremia * PCR * Landmark", "Viremia * Serotype * Immune status",
+                       "Serotype * PCR * Day", "Serotype * PCR * Landmark",
+                       
+                       "Viremia * Serotype * PCR * Day", "Viremia * Serotype * PCR * Landmark"),
+         p = ifelse(p < 0.0001, "<0.0001", sprintf("%.4f", round(p, 4)))) %>%
+  select(Parameter, p)
+
+knitr::kable(t2)
+```
+
+
+############################################################
+### Appendix 6-figure 1. Fitted trends in mean platelet counts by subgroups of the covariates - results from the supermodel
+```{r Appendix 6-figure 1, message=TRUE, warning=TRUE, include=FALSE}
+# Create new data for prediction
+nDF <- expand.grid(log10_vir = c(log10(60), log10(300), log10(600), 3.01, 3:10),
+                   cAge = c(-3,2,7),
+                   Sex = factor(c("Male","Female")),
+                   LM = c(1:7),
+                   DOI = c(1:10),
+                   Serotype = factor(c("DENV-1","DENV-2","DENV-3","DENV-4")),
+                   Serology = factor(c("Probable primary","Probable secondary","Indeterminate")),
+                   PCR = factor(c("Two-step", "One-step"))) %>%
+  mutate(log10_vir2 = log10_vir,
+         vir01 = ifelse(log10_vir<=3, 1, 0),
+         Serology = factor(Serology, levels = c("Probable secondary","Probable primary","Indeterminate")),
+         Age = cAge + 13,
+         LM_factor = as.factor(LM),
+         Sex = factor(Sex, levels = c("Male", "Female")),
+         PCR = factor(PCR, levels = c("Two-step", "One-step"))) %>%
+  filter(!(log10_vir<3 & PCR=="Two-step")) %>%
+  filter(!(log10_vir==log10(300) & !Serotype %in% c("DENV-1", "DENV-3"))) %>%
+  filter(!(log10_vir==log10(60) & !Serotype=="DENV-2")) %>%
+  filter(!(log10_vir==log10(600) & !Serotype=="DENV-4")) %>%
+  as.data.frame(.)
+
+DOI.labs <- c("Day 1", "Day 2", "Day 3", "Day 4", "Day 5", "Day 6", "Day 7", "Day 8", "Day 9", "Day 10")
+names(DOI.labs) <- c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10")
+LM.labs <- c("LM day 1", "LM day 2", "LM day 3", "LM day 4", "LM day 5", "LM day 6", "LM day 7")
+names(LM.labs) <- c("1", "2", "3", "4", "5", "6", "7")
+
+nDF1 <- nDF %>% filter(LM==1) %>% filter(DOI>=LM) %>% filter(log10_vir>=5 & log10_vir<=10)
+nDF2 <- nDF %>% filter(LM==2) %>% filter(DOI>=LM) %>% filter((log10_vir>=4 & log10_vir<=10))
+nDF3 <- nDF %>% filter(LM==3) %>% filter(DOI>=LM) %>% filter((log10_vir>=3 & log10_vir<=9) | log10_vir<=3)
+nDF4 <- nDF %>% filter(LM==4) %>% filter(DOI>=LM) %>% filter((log10_vir>=3 & log10_vir<=8) | log10_vir<=3)
+nDF5 <- nDF %>% filter(LM==5) %>% filter(DOI>=LM) %>% filter((log10_vir>=3 & log10_vir<=7) | log10_vir<=3)
+nDF6 <- nDF %>% filter(LM==6) %>% filter(DOI>=LM) %>% filter((log10_vir>=3 & log10_vir<=6) | log10_vir<=3)
+nDF7 <- nDF %>% filter(LM==7) %>% filter(DOI>=LM) %>% filter((log10_vir>=3 & log10_vir<=5) | log10_vir<=3) %>% 
+  filter(Serotype!="DENV-4")
+
+# Make prediction
+pmplm81 <- get_pred_lmer(mplm8, "PLT_sq", nDF1, "4root")
+pmplm82 <- get_pred_lmer(mplm8, "PLT_sq", nDF2, "4root")
+pmplm83 <- get_pred_lmer(mplm8, "PLT_sq", nDF3, "4root")
+pmplm84 <- get_pred_lmer(mplm8, "PLT_sq", nDF4, "4root")
+pmplm85 <- get_pred_lmer(mplm8, "PLT_sq", nDF5, "4root")
+pmplm86 <- get_pred_lmer(mplm8, "PLT_sq", nDF6, "4root")
+pmplm87 <- get_pred_lmer(mplm8, "PLT_sq", nDF7, "4root")
+pmplm8 <- bind_rows(pmplm81, pmplm82, pmplm83, pmplm84, pmplm85, pmplm86, pmplm87) %>% 
+  filter(!(log10_vir==3 & PCR=="One-step")) # to exclude the undetectable values setting as 1000, as this model used the LOD as LOD
+
+
+# Plot by immune status
+pdat <- pmplm8 %>% 
+  filter(LM %in% c(4), Age==10, Serotype=="DENV-1", Sex=="Male", PCR=="One-step") %>%
+  mutate(log10_vir = ifelse(log10_vir <= 3, 2, log10_vir),
+         Serology = factor(Serology, levels=c("Probable primary","Probable secondary","Indeterminate")))
+
+p1 <- ggplot(data = filter(pdat, log10_vir > 2)) +
+  geom_ribbon(aes(x = log10_vir, ymin = low, ymax = upp, fill = Serology), alpha = .2) +
+  geom_line(aes(x = log10_vir, y = pred, color = Serology), alpha = .8, linewidth = .4) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(x = log10_vir, ymin = low, ymax = upp, color = Serology), position = position_dodge(.5), width = .3, size = .4, alpha = 0.7) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(x = log10_vir, y = pred, color = Serology), position = position_dodge(.5), size = .8, alpha = .95) +
+  labs(y = expression(paste("Platelet count (×", 10^{9}, "/L)", sep="")), x = "Viremia levels (log-10 copies/ml)") +
+  scale_x_continuous(breaks = c(2:10), labels = c("U", 3:10)) +
+  scale_fill_manual(name = "(A) Immune status          ", values = c("blue", "red", "#999999")) +
+  scale_color_manual(name = "(A) Immune status          ", values = c("blue", "red", "#999999")) +
+  theme(legend.position = "top", axis.title.x = element_blank(), legend.justification = 'left', legend.title = element_text(face = "bold")) +
+  #facet_grid(cols = vars(DOI), rows = vars(LM), labeller = labeller(DOI = DOI.labs, LM = LM.labs)) +
+  facet_grid(cols = vars(DOI), labeller = labeller(DOI = DOI.labs)) +
+  coord_cartesian(ylim = c(70,570))
+
+# Plot by sex
+pdat <- pmplm8 %>% 
+  filter(LM %in% c(4), Age==10, Serotype=="DENV-1", Serology=="Probable secondary", PCR=="One-step") %>%
+  mutate(log10_vir = ifelse(log10_vir <= 3, 2, log10_vir))
+
+p2 <- ggplot(data = filter(pdat, log10_vir > 2)) +
+  geom_ribbon(aes(x = log10_vir, ymin = low, ymax = upp, fill = Sex), alpha = .2) +
+  geom_line(aes(x = log10_vir, y = pred, color = Sex), alpha = .8, linewidth = .4) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(x = log10_vir, ymin = low, ymax = upp, color = Sex), position = position_dodge(.5), width = .3, size = .4, alpha = 0.7) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(x = log10_vir, y = pred, color = Sex), position = position_dodge(.5), size = .8, alpha = .95) +
+  labs(y = expression(paste("Platelet count (×", 10^{9}, "/L)", sep="")), x = "Viremia levels (log-10 copies/ml)") +
+  scale_x_continuous(breaks = c(2:10), labels = c("U", 3:10)) +
+  scale_fill_manual(name = "(B) Sex        ", values = c("#E69F00", "#56B4E9")) +
+  scale_color_manual(name = "(B) Sex        ", values = c("#E69F00", "#56B4E9")) +
+  theme(legend.position = "top", axis.title.x = element_blank(), legend.justification = 'left', legend.title = element_text(face = "bold")) +
+  #facet_grid(cols = vars(DOI), rows = vars(LM), labeller = labeller(DOI = DOI.labs, LM = LM.labs)) +
+  facet_grid(cols = vars(DOI), labeller = labeller(DOI = DOI.labs)) +
+  coord_cartesian(ylim = c(70,570))
+
+# Plot by age
+pdat <- pmplm8 %>% 
+  filter(LM %in% c(4), Sex=="Male", Serotype=="DENV-1", Serology=="Probable secondary", PCR=="One-step") %>%
+  mutate(Age = factor(Age, levels=c(10,15,20), labels=c("10 years","15 years","20 years")),
+         log10_vir = ifelse(log10_vir <= 3, 2, log10_vir))
+
+p3 <- ggplot(data = filter(pdat, log10_vir > 2)) +
+  geom_ribbon(aes(x = log10_vir, ymin = low, ymax = upp, fill = Age), alpha = .2) +
+  geom_line(aes(x = log10_vir, y = pred, color = Age), alpha = .8, linewidth = .4) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(x = log10_vir, ymin = low, ymax = upp, color = Age), position = position_dodge(.5), width = .3, size = .4, alpha = 0.7) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(x = log10_vir, y = pred, color = Age), position = position_dodge(.5), size = .8, alpha = .95) +
+  labs(y = expression(paste("Platelet count (×", 10^{9}, "/L)", sep="")), x = "Viremia levels (log-10 copies/ml)") +
+  scale_x_continuous(breaks = c(2:10), labels = c("U", 3:10)) +
+  scale_fill_brewer(name = "(C) Age          ", palette = "Set1") +
+  scale_color_brewer(name = "(C) Age          ", palette = "Set1") +
+  theme(legend.position = "top", axis.title.x = element_blank(), legend.justification = 'left', legend.title = element_text(face = "bold")) +
+  #facet_grid(cols = vars(DOI), rows = vars(LM), labeller = labeller(DOI = DOI.labs, LM = LM.labs)) +
+  facet_grid(cols = vars(DOI), labeller = labeller(DOI = DOI.labs)) +
+  coord_cartesian(ylim = c(70,570))
+
+# Plot by PCR
+pdat <- pmplm8 %>% 
+  filter(LM %in% c(4), Age==10, Serotype=="DENV-1", Serology=="Probable secondary", Sex=="Male") %>%
+  mutate(log10_vir = ifelse(log10_vir <= 3, 2, log10_vir),
+         PCR = relevel(PCR, ref="One-step"))
+
+p4 <- ggplot(data = filter(pdat, log10_vir > 2)) +
+  geom_ribbon(aes(x = log10_vir, ymin = low, ymax = upp, fill = PCR), alpha = .2) +
+  geom_line(aes(x = log10_vir, y = pred, color = PCR), alpha = .8, linewidth = .4) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(x = log10_vir, ymin = low, ymax = upp, color = PCR), position = position_dodge(.5), width = .3, size = .4, alpha = 0.7) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(x = log10_vir, y = pred, color = PCR), position = position_dodge(.5), size = .8, alpha = .95) +
+  labs(y = expression(paste("Platelet count (×", 10^{9}, "/L)", sep="")), x = "Viremia levels (log-10 copies/ml)") +
+  scale_x_continuous(breaks = c(2:10), labels = c("U", 3:10)) +
+  scale_fill_discrete(name = "(D) PCR method          ") +
+  scale_color_discrete(name = "(D) PCR method          ") +
+  theme(legend.position = "top", legend.justification = 'left', legend.title = element_text(face = "bold")) +
+  #facet_grid(cols = vars(DOI), rows = vars(LM), labeller = labeller(DOI = DOI.labs, LM = LM.labs)) +
+  facet_grid(cols = vars(DOI), labeller = labeller(DOI = DOI.labs)) +
+  coord_cartesian(ylim = c(70,570))
+
+# Combine plots
+p <- grid.arrange(p1, p2, p3, p4, ncol=1, heights=c(1,1,1,1.08))
+
+ggsave("A6_Fig1.jpg", p, width=7.5, height=9)
+```
+
+
+############################################################
+### Appendix 7-table 1. Estimates from model of viremia and clinical outcomes
+```{r Appendix 7-table 1, echo=FALSE, message=FALSE, warning=FALSE}
+# Fit models------------------------------------------------------------------------------------------
+## Severe dengue
+LMdats1$Serology <- relevel(LMdats1$Serology, ref = "Probable secondary")
+
+ms1 <- geeglm(Severe ~ rcs(clog10_vir, c(4,6.4,8.5)-6.38) + vir01 + rcs(cLM,c(2,4,6)-3) + rcs(cAge,c(7,13,28)-13) + 
+                Sex + Serotype * Serology + Study +
+                clog10_vir : (rcs(cLM,c(2,4,6)-3) * Serotype * Serology + rcs(cAge,c(7,13,28)-13) + Sex + Study),
+              id = Code, data = LMdats1, family = binomial, corstr = "independence")
+
+## Plasma leakage
+LMdatl$Serology <- relevel(LMdatl$Serology, ref = "Probable secondary")
+
+ml1 <- geeglm(Leakage ~ rcs(clog10_vir,c(4,6.4,8.5)-6.38) + vir01 + rcs(cLM,c(2,4,6)-3) + rcs(cAge,c(7,13,28)-13) + 
+                Sex + Serotype * Serology + Study +
+                clog10_vir : (rcs(cLM,c(2,4,6)-3) * Serotype * Serology + rcs(cAge,c(7,13,28)-13) + Sex + Study) +
+                vir01 : (cLM + cAge + Sex + Serotype + Serology + Study),
+              id = Code, data = LMdatl, family = binomial, corstr = "independence")
+
+# Get p-values------------------------------------------------------------------------------------------
+## Severe dengue
+coef <- ms1$coefficients
+tmp <- data.frame(para = rownames(vcov(ms1)), num = 1:nrow(vcov(ms1)))
+  
+clog10_vir <- tmp$num[grepl("clog10_vir", tmp$para)]
+vir01 <- tmp$num[grepl("vir01", tmp$para)]
+cAge <- tmp$num[grepl("cAge", tmp$para)]
+Sex <- tmp$num[grepl("Sex", tmp$para)]
+Serotype <- tmp$num[grepl("Serotype", tmp$para)]
+Serology <- tmp$num[grepl("Serology", tmp$para)]
+Study <- tmp$num[grepl("Study", tmp$para)]
+cLM <- tmp$num[grepl("cLM", tmp$para)]
+vir_age <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("cAge", tmp$para)]
+vir_sex <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Sex", tmp$para)]
+vir_serotype <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para)]
+vir_serology <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serology", tmp$para)]
+vir_serotype_serology <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para) & grepl("Serology", tmp$para)]
+vir_serotype_LM <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para) & grepl("cLM", tmp$para)]
+vir_serology_LM <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serology", tmp$para) & grepl("cLM", tmp$para)]
+vir_serotype_serology_LM <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para) & grepl("Serology", tmp$para) & grepl("cLM", tmp$para)]
+vir_study <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Study", tmp$para)]
+vir_LM <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("cLM", tmp$para)]
+serotype_serology <- tmp$num[grepl("Serotype", tmp$para) & grepl("Serology", tmp$para)]
+vir_spline <- tmp$num[grepl("clog10_vir'", tmp$para)]
+age_spline <- tmp$num[grepl("cAge'", tmp$para)]
+LM_spline <- tmp$num[grepl("cLM'", tmp$para)]
+
+library(aod)
+
+p1 <- data.frame(
+  p1 = c(wald.test(b=coef, Sigma=vcov(ms1), Terms=clog10_vir)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=vir01)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=cAge)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=Sex)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=Serotype)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=Serology)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=Study)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=cLM)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=vir_age)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=vir_sex)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=vir_LM)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=vir_serotype)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=vir_serology)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=vir_serotype_serology)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=vir_serotype_LM)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=vir_serology_LM)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=vir_serotype_serology_LM)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=vir_study)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=serotype_serology)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=vir_spline)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=age_spline)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ms1), Terms=LM_spline)$result$chi2[3]),
+  n = c("Viremia level (log-10 copies/ml)", "Undetectable viremia", 
+        "Age (years)", "Sex", "Serotype", "Immune status", "Study", "Landmark (day)",
+        " - With age", " - With sex", " - With landmark",
+        " - With serotype", " - With immune status", " - With serotype * immune status",
+        " - With serotype * landmark", " - With immune status * landmark",
+        " - With serotype * immune status * landmark", " - With study",
+        "Interaction of serotype and immune status",
+        " - Viremia level", " - Age", " - Landmark")) %>% 
+  mutate(p1 = ifelse(p1 < .001, "<0.001", sprintf("%.3f", round(p1, 3))))
+
+## Plasma leakage
+coef <- ml1$coefficients
+tmp <- data.frame(para = rownames(vcov(ml1)), num = 1:nrow(vcov(ml1)))
+  
+clog10_vir <- tmp$num[grepl("clog10_vir", tmp$para)]
+vir01 <- tmp$num[grepl("vir01", tmp$para)]
+cAge <- tmp$num[grepl("cAge", tmp$para)]
+Sex <- tmp$num[grepl("Sex", tmp$para)]
+Serotype <- tmp$num[grepl("Serotype", tmp$para)]
+Serology <- tmp$num[grepl("Serology", tmp$para)]
+Study <- tmp$num[grepl("Study", tmp$para)]
+cLM <- tmp$num[grepl("cLM", tmp$para)]
+vir_age <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("cAge", tmp$para)]
+vir_sex <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Sex", tmp$para)]
+vir_serotype <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para)]
+vir_serology <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serology", tmp$para)]
+vir_serotype_serology <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para) & grepl("Serology", tmp$para)]
+vir_serotype_LM <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para) & grepl("cLM", tmp$para)]
+vir_serology_LM <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serology", tmp$para) & grepl("cLM", tmp$para)]
+vir_serotype_serology_LM <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Serotype", tmp$para) & grepl("Serology", tmp$para) & grepl("cLM", tmp$para)]
+vir_study <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("Study", tmp$para)]
+serotype_serology <- tmp$num[grepl("Serotype", tmp$para) & grepl("Serology", tmp$para)]
+vir_LM <- tmp$num[(grepl("clog10_vir", tmp$para) | grepl("vir01", tmp$para)) & grepl("cLM", tmp$para)]
+vir_spline <- tmp$num[grepl("clog10_vir'", tmp$para)]
+age_spline <- tmp$num[grepl("cAge'", tmp$para)]
+LM_spline <- tmp$num[grepl("cLM'", tmp$para)]
+
+p2 <- data.frame(
+  p2 = c(wald.test(b=coef, Sigma=vcov(ml1), Terms=clog10_vir)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=vir01)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=cAge)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=Sex)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=Serotype)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=Serology)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=Study)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=cLM)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=vir_age)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=vir_sex)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=vir_LM)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=vir_serotype)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=vir_serology)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=vir_serotype_serology)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=vir_serotype_LM)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=vir_serology_LM)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=vir_serotype_serology_LM)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=vir_study)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=serotype_serology)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=vir_spline)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=age_spline)$result$chi2[3],
+         wald.test(b=coef, Sigma=vcov(ml1), Terms=LM_spline)$result$chi2[3]),
+  n = c("Viremia level (log-10 copies/ml)", "Undetectable viremia", 
+        "Age (years)", "Sex", "Serotype", "Immune status", "Study", "Landmark (day)",
+        " - With age", " - With sex", " - With landmark",
+        " - With serotype", " - With immune status", " - With serotype * immune status", 
+        " - With serotype * landmark", " - With immune status * landmark",
+        " - With serotype * immune status * landmark", " - With study",
+        "Interaction of serotype and immune status",
+        " - Viremia level", " - Age", " - Landmark")) %>%
+  mutate(p2 = ifelse(p2 < .001, "<0.001", sprintf("%.3f", round(p2, 3))))
+
+# Get ORs------------------------------------------------------------------------------------------
+get_OR <- function(model, var, ref1, ref2, doi) {
+  tmp <- data.frame(clog10_vir = 7-6.38, vir01 = 0, 
+                    cAge = 10-13, Sex = "Male", Serotype = "DENV-1", Serology = "Probable secondary",
+                    Study = "22DX", cLM = as.numeric(doi)-3)
+  nda <- ndb <- tmp
+  nda[, names(nda)==var] <- ifelse(var %in% c("clog10_vir", "vir01", "cAge", "cLM"), as.numeric(ref1), ref1)
+  ndb[, names(ndb)==var] <- ifelse(var %in% c("clog10_vir", "vir01", "cAge", "cLM"), as.numeric(ref2), ref2)
+  nda$clog10_vir <- ifelse(nda$vir01==1, 3-6.38, nda$clog10_vir)
+  ndb$clog10_vir <- ifelse(nda$clog10_vir==3-6.38, 3-6.38, ndb$clog10_vir)
+  est <- exp(Epi::ci.lin(model, list(nda, ndb)))
+  or <- sprintf("%.2f", round(est[1], 2))
+  lo <- sprintf("%.2f", round(est[5], 2))
+  up <- sprintf("%.2f", round(est[6], 2))
+  return(paste(or, " (", lo, "; ", up, ")", sep=""))
+}
+
+r1 <- c("clog10_vir", 7-6.38, 6-6.38, 1)
+r2 <- c("clog10_vir", 8-6.38, 7-6.38, 1)
+r3 <- c("clog10_vir", 7-6.38, 6-6.38, 2)
+r4 <- c("clog10_vir", 8-6.38, 7-6.38, 2)
+r5 <- c("clog10_vir", 7-6.38, 6-6.38, 3)
+r6 <- c("clog10_vir", 8-6.38, 7-6.38, 3)
+r7 <- c("clog10_vir", 7-6.38, 6-6.38, 4)
+r8 <- c("clog10_vir", 8-6.38, 7-6.38, 4)
+r9 <- c("clog10_vir", 7-6.38, 6-6.38, 5)
+r10 <- c("clog10_vir", 8-6.38, 7-6.38, 5)
+r11 <- c("vir01", 1, 0, 3)
+r12 <- c("cAge", 15-13, 10-13, 3)
+r13 <- c("cAge", 20-13, 15-13, 3)
+r14 <- c("Sex", "Male", "Female", 3)
+r15 <- c("Serotype", "DENV-2", "DENV-1", 3)
+r16 <- c("Serotype", "DENV-3", "DENV-1", 3)
+r17 <- c("Serotype", "DENV-4", "DENV-1", 3)
+r18 <- c("Serology", "Probable primary", "Probable secondary", 3)
+r19 <- c("Serology", "Indeterminate", "Probable secondary", 3)
+r20 <- c("Study", "DR", "22DX", 3)
+r21 <- c("Study", "MD", "22DX", 3)
+r22 <- c("cLM", 5-3, 3-3, 3)
+r23 <- c("cLM", 7-3, 5-3, 3)
+
+dummyset <- c(r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19, r20, r21, r22, r23)
+len <- length(r1)
+dt <- data.frame(matrix(data = dummyset, ncol = len, byrow = T))
+var <- dt$X1
+ref1 <- dt$X2
+ref2 <- dt$X3
+doi <- dt$X4
+
+OR1 <- OR2 <- rep(NA, length(var))
+
+for (i in (1:length(var))) {
+  OR1[i] <- get_OR(ms1, var[i], ref1[i], ref2[i], doi[i])
+  OR2[i] <- get_OR(ml1, var[i], ref1[i], ref2[i], doi[i])
+}
+
+ndummy <- c(" - 7 versus 6 (on day 1)", " - 8 versus 7 (on day 1)",
+            " - 7 versus 6 (on day 2)", " - 8 versus 7 (on day 2)",
+            " - 7 versus 6 (on day 3)", " - 8 versus 7 (on day 3)",
+            " - 7 versus 6 (on day 4)", " - 8 versus 7 (on day 4)",
+            " - 7 versus 6 (on day 5)", " - 8 versus 7 (on day 5)",
+            " - Yes",
+            " - 15 versus 10", " - 20 versus 15",
+            " - Male",
+            " - DENV-2", " - DENV-3", " - DENV-4",
+            " - Probable primary", " - Indeterminate",
+            " - Study A", " - Study B",
+            " - 5 versus 3", " - 7 versus 5")
+
+nref <- c(" - No", " - Female", " - DENV-1", " - Probable secondary", " - Study C")
+
+est1 <- data.frame(n = ndummy, OR1 = OR1)
+est2 <- data.frame(n = ndummy, OR2 = OR2)
+
+# Combine results
+res <- data.frame(
+  var = c("Viremia level (log-10 copies/ml)",
+          " - 7 versus 6 (on day 1)", " - 8 versus 7 (on day 1)", 
+          " - 7 versus 6 (on day 2)", " - 8 versus 7 (on day 2)",
+          " - 7 versus 6 (on day 3)", " - 8 versus 7 (on day 3)",
+          " - 7 versus 6 (on day 4)", " - 8 versus 7 (on day 4)",
+          " - 7 versus 6 (on day 5)", " - 8 versus 7 (on day 5)",
+          "Undetectable viremia", 
+          " - No", " - Yes",
+          "Age (years)",
+          " - 15 versus 10", " - 20 versus 15", 
+          "Sex",
+          " - Female", " - Male",
+          "Serotype",
+          " - DENV-1", " - DENV-2", " - DENV-3", " - DENV-4",
+          "Immune status",
+          " - Probable primary", " - Probable secondary", " - Indeterminate",
+          "Study",
+          " - Study C", " - Study A", " - Study B",
+          "Landmark (day)",
+          " - 5 versus 3", " - 7 versus 5",
+          "Interaction of viremia",
+          " - With age", " - With sex", " - With landmark", " - With study",
+          " - With serotype", " - With immune status", " - With serotype * immune status",
+          " - With serotype * landmark", " - With immune status * landmark", " - With serotype * immune status * landmark",
+          "Interaction of serotype and immune status",
+          "Nonlinear trend",
+          " - Viremia level", " - Age", " - Landmark")) %>%
+  mutate(n = var) %>%
+  left_join(., est1, by = "n") %>%
+  left_join(., p1, by = "n") %>%
+  left_join(., est2, by = "n") %>%
+  left_join(., p2, by = "n") %>%
+  mutate(OR1 = ifelse(n %in% nref, "Ref", as.character(OR1)),
+         OR2 = ifelse(n %in% nref, "Ref", as.character(OR2))) %>%
+  select(-n)
+
+knitr::kable(res)
+```
+
+
+############################################################
+### Appendix 7-figure 1. Frequency of the outcomes and regression coefficients for individuals observed and without the outcome at each landmark time point
+```{r Appendix 7-figure 1, message=FALSE, warning=FALSE, include=FALSE}
+# Severe dengue-----------------------------
+## Descriptive analysis
+LMdats <- LMdats1
+
+library(ggpubr)
+stab <- desc_statby(LMdats, measure.var = "Severe", grps = "LM") %>%
+  mutate(Severe = length * mean,
+         mean = sprintf("%.1f", round(mean * 100, 1))) %>%
+  select(LM, length, Severe, mean) %>%
+  rename(`Landmark` = LM,
+         `Severe dengue` = Severe,
+         `N` = length,
+         `Percentage` = mean)
+
+stab.p <- ggtexttable(stab, rows=NULL)
+
+## Regression coefficients at landmark time points
+LMs <- unique(LMdats$LM)
+nLM <- length(LMs)
+beta <- lower <- upper <- beta_lod <- lower_lod <- upper_lod <- matrix(NA, nLM, 1)
+
+for (i in 1:nLM) {
+  LM <- LMs[i]
+  LMdatai <- LMdats[LMdats$LM == LM,]
+  m <- glm(Severe ~ log10_vir + vir01, data = LMdatai, family = binomial)
+  beta[i,] <- coef(m)[2]
+  lower[i,] <- confint(m)[2,1]
+  upper[i,] <- confint(m)[2,2]
+}
+
+for (i in 1:nLM) {
+  LM <- LMs[i]
+  LMdatai <- LMdats[LMdats$LM == LM,]
+  m <- glm(Severe ~ log10_vir + vir01, data = LMdatai, family = binomial)
+  beta_lod[i,] <- coef(m)[3]
+  lower_lod[i,] <- confint(m)[3,1]
+  upper_lod[i,] <- confint(m)[3,2]
+}
+
+coef_dats <- data.frame(cbind(LMs, beta, lower, upper))
+coef_dats_lod <- data.frame(cbind(LMs, beta_lod, lower_lod, upper_lod)) %>%
+  mutate(V2 = ifelse(LMs<5, NA, V2),
+         V3 = ifelse(LMs<5, NA, V3),
+         V4 = ifelse(LMs<5, NA, V4))
+
+pcoef <- ggplot(coef_dats, aes(LMs, V2)) +
+  geom_line(size = 1.1) +
+  geom_line(aes(y = V3), linetype = 2) +
+  geom_line(aes(y = V4), linetype = 2) +
+  labs(x = "Illness day (landmark time point)", y = "Regression coefficient (log odds)", 
+       subtitle = "Detectable viremia for severe dengue") +
+  scale_x_continuous(breaks = c(1:10))
+
+pcoef_lod <- ggplot(coef_dats_lod, aes(LMs, V2)) +
+  geom_line(size = 1.1) +
+  geom_line(aes(y = V3), linetype = 2) +
+  geom_line(aes(y = V4), linetype = 2) +
+  labs(x = "Illness day (landmark time point)", y = "Regression coefficient (log odds)", 
+       subtitle = "Undetectable viremia for severe dengue") +
+  scale_x_continuous(breaks = c(1:10))
+
+ps <- ggarrange(stab.p, pcoef, pcoef_lod, nrow=3, heights = c(1,1.4,1.4))
+
+# Plasma leakage-----------------------------
+## Descriptive analysis
+stab <- desc_statby(LMdatl, measure.var = "Leakage", grps = "LM") %>%
+  mutate(Leakage = length * mean,
+         mean = sprintf("%.1f", round(mean * 100, 1))) %>%
+  select(LM, length, Leakage, mean) %>%
+  rename(`Landmark` = LM,
+         `Plasma leakage` = Leakage,
+         `N` = length,
+         `Percentage` = mean)
+
+stab.p <- ggtexttable(stab, rows=NULL)
+
+## Regression coefficients at landmark time points
+LMs <- unique(LMdatl$LM)
+nLM <- length(LMs)
+beta <- lower <- upper <- beta_lod <- lower_lod <- upper_lod <- matrix(NA, nLM, 1)
+
+for (i in 1:nLM) {
+  LM <- LMs[i]
+  LMdatai <- LMdatl[LMdatl$LM == LM,]
+  m <- glm(Leakage ~ log10_vir + vir01, data = LMdatai, family = binomial)
+  beta[i,] <- coef(m)[2]
+  lower[i,] <- confint(m)[2,1]
+  upper[i,] <- confint(m)[2,2]
+}
+
+for (i in 1:nLM) {
+  LM <- LMs[i]
+  LMdatai <- LMdatl[LMdatl$LM == LM,]
+  m <- glm(Leakage ~ log10_vir + vir01, data = LMdatai, family = binomial)
+  beta_lod[i,] <- coef(m)[3]
+  lower_lod[i,] <- confint(m)[3,1]
+  upper_lod[i,] <- confint(m)[3,2]
+}
+
+coef_datl <- data.frame(cbind(LMs, beta, lower, upper))
+coef_datl_lod <- data.frame(cbind(LMs, beta_lod, lower_lod, upper_lod)) %>%
+  mutate(V2 = ifelse(LMs<3, NA, V2),
+         V3 = ifelse(LMs<3, NA, V3),
+         V4 = ifelse(LMs<3, NA, V4))
+
+pcoef <- ggplot(coef_datl, aes(LMs, V2)) +
+  geom_line(size = 1.1) +
+  geom_line(aes(y = V3), linetype = 2) +
+  geom_line(aes(y = V4), linetype = 2) +
+  labs(x = "Illness day (landmark time point)", y = "Regression coefficient (log odds)", 
+       subtitle = "Detectable viremia for plasma leakage") +
+  scale_x_continuous(breaks = c(1:10)) +
+  scale_y_continuous(breaks = c(0:10)*.2)
+
+pcoef_lod <- ggplot(coef_datl_lod, aes(LMs, V2)) +
+  geom_line(size = 1.1) +
+  geom_line(aes(y = V3), linetype = 2) +
+  geom_line(aes(y = V4), linetype = 2) +
+  labs(x = "Illness day (landmark time point)", y = "Regression coefficient (log odds)", 
+       subtitle = "Undetectable viremia for plasma leakage") +
+  scale_x_continuous(breaks = c(1:10))
+
+pl <- ggarrange(stab.p, pcoef, pcoef_lod, nrow=3, heights = c(1,1.4,1.4))
+
+# Combine results---------------------
+p <- ggarrange(ps, pl, ncol=2)
+ggsave("A7_Fig1.jpg", p, width=9, height=8)
+```
+
+
+############################################################
+### Appendix 7-figure 2. Probability of occurrence of the two clinical endpoints according to viremia levels by subgroups of the covariates - results from the supermodel
+```{r Appendix 7-figure 2, message=FALSE, warning=FALSE, include=FALSE}
+DOI.labs <- c("LM day 1", "LM day 2", "LM day 3", "LM day 4", "LM day 5", "LM day 6", "LM day 7")
+names(DOI.labs) <- c("1", "2", "3", "4", "5", "6", "7")
+
+# Immune status
+pdat <- bind_rows(mutate(pms1, out="Severe dengue"), mutate(pml1, out="Plasma leakage")) %>% 
+  filter(Age==10, Sex=="Male", Study=="22DX", Serotype=="DENV-1") %>% 
+  mutate(log10_vir = ifelse(log10_vir <= 3, 2, log10_vir),
+         DOI = as.factor(DOI),
+         out = factor(out, levels=c("Severe dengue", "Plasma leakage")),
+         Serology = factor(Serology, levels=c("Probable primary","Probable secondary","Indeterminate")))
+
+p1 <- ggplot(pdat, aes(x = log10_vir, y = pred)) +
+  geom_ribbon(data = filter(pdat, log10_vir>2), aes(ymin = low, ymax = upp, fill = Serology), alpha = .15) +
+  geom_line(data = filter(pdat, log10_vir>2), aes(color = Serology), alpha = .7) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(ymin = low, ymax = upp, color = Serology), width=.2, linewidth=.5, alpha=0.6, position = position_dodge(.6)) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(color = Serology), size = 1.2, position = position_dodge(.6)) +
+  labs(x = "Viremia levels (log-10 copies/ml)", y = "Probability of occurrence") +
+  scale_x_continuous(breaks = 2:10, labels = c("U", 3:10)) +
+  scale_y_continuous(breaks = c(0:4)*.1, labels = c("0%","10%","20%","30%","40%")) +
+  scale_fill_manual(name = "(A) Immune status          ", values = c("blue", "red", "#999999")) +
+  scale_color_manual(name = "(A) Immune status          ", values = c("blue", "red", "#999999")) +
+  #coord_cartesian(ylim = c(0, .35)) +
+  theme(legend.position = "top", axis.title.x = element_blank(), legend.justification = 'left', legend.title = element_text(face = "bold")) +
+  facet_grid(rows = vars(out), cols = vars(DOI), labeller = labeller(DOI = DOI.labs), scales = "free") +
+  coord_cartesian_panels(
+    panel_limits = tibble::tribble(
+      ~out, ~ymin, ~ymax, 
+      "Severe dengue", -.005, .16,
+      "Plasma leakage", -.01, .34
+    )
+  )
+
+# Sex
+pdat <- bind_rows(mutate(pms1, out="Severe dengue"), mutate(pml1, out="Plasma leakage")) %>% 
+  filter(Age==10, Serology=="Probable secondary", Study=="22DX", Serotype=="DENV-1") %>% 
+  mutate(log10_vir = ifelse(log10_vir <= 3, 2, log10_vir),
+         DOI = as.factor(DOI),
+         out = factor(out, levels=c("Severe dengue", "Plasma leakage")))
+
+p2 <- ggplot(pdat, aes(x = log10_vir, y = pred)) +
+  geom_ribbon(data = filter(pdat, log10_vir>2), aes(ymin = low, ymax = upp, fill = Sex), alpha = .15) +
+  geom_line(data = filter(pdat, log10_vir>2), aes(color = Sex), alpha = .7) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(ymin = low, ymax = upp, color = Sex), width=.2, linewidth=.5, alpha=0.6, position = position_dodge(.6)) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(color = Sex), size = 1.2, position = position_dodge(.6)) +
+  labs(x = "Viremia levels (log-10 copies/ml)", y = "Probability of occurrence") +
+  scale_x_continuous(breaks = 2:10, labels = c("U", 3:10)) +
+  scale_y_continuous(breaks = c(0:4)*.1, labels = c("0%","10%","20%","30%","40%")) +
+  scale_fill_manual(name = "(B) Sex        ", values = c("#E69F00", "#56B4E9")) +
+  scale_color_manual(name = "(B) Sex        ", values = c("#E69F00", "#56B4E9")) +
+  #coord_cartesian(ylim = c(0, .35)) +
+  theme(legend.position = "top", axis.title.x = element_blank(), legend.justification = 'left', legend.title = element_text(face = "bold")) +
+  facet_grid(rows = vars(out), cols = vars(DOI), labeller = labeller(DOI = DOI.labs), scales = "free") +
+  coord_cartesian_panels(
+    panel_limits = tibble::tribble(
+      ~out, ~ymin, ~ymax, 
+      "Severe dengue", -.005, .16,
+      "Plasma leakage", -.01, .34
+    )
+  )
+
+# Age
+pdat <- bind_rows(mutate(pms1, out="Severe dengue"), mutate(pml1, out="Plasma leakage")) %>% 
+  filter(Sex=="Male", Serology=="Probable secondary", Study=="22DX", Serotype=="DENV-1", Age %in% c(10,15,20)) %>% 
+  mutate(log10_vir = ifelse(log10_vir <= 3, 2, log10_vir),
+         DOI = as.factor(DOI),
+         out = factor(out, levels=c("Severe dengue", "Plasma leakage")),
+         Age = factor(Age, levels=c(10,15,20), labels=c("10 years","15 years","20 years")))
+
+p3 <- ggplot(pdat, aes(x = log10_vir, y = pred)) +
+  geom_ribbon(data = filter(pdat, log10_vir>2), aes(ymin = low, ymax = upp, fill = Age), alpha = .15) +
+  geom_line(data = filter(pdat, log10_vir>2), aes(color = Age), alpha = .7) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(ymin = low, ymax = upp, color = Age), width=.2, linewidth=.5, alpha=0.6, position = position_dodge(.6)) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(color = Age), size = 1.2, position = position_dodge(.6)) +
+  labs(x = "Viremia levels (log-10 copies/ml)", y = "Probability of occurrence") +
+  scale_x_continuous(breaks = 2:10, labels = c("U", 3:10)) +
+  scale_y_continuous(breaks = c(0:4)*.1, labels = c("0%","10%","20%","30%","40%")) +
+  scale_fill_brewer(name = "(C) Age          ", palette = "Set1") +
+  scale_color_brewer(name = "(C) Age          ", palette = "Set1") +
+  #coord_cartesian(ylim = c(0, .35)) +
+  theme(legend.position = "top", axis.title.x = element_blank(), legend.justification = 'left', legend.title = element_text(face = "bold")) +
+  facet_grid(rows = vars(out), cols = vars(DOI), labeller = labeller(DOI = DOI.labs), scales = "free") +
+  coord_cartesian_panels(
+    panel_limits = tibble::tribble(
+      ~out, ~ymin, ~ymax, 
+      "Severe dengue", -.005, .16,
+      "Plasma leakage", -.01, .34
+    )
+  )
+
+# Study
+pdat <- bind_rows(mutate(pms1, out="Severe dengue"), mutate(pml1, out="Plasma leakage")) %>% 
+  filter(Sex=="Male", Serology=="Probable secondary", Age==10, Serotype=="DENV-1") %>% 
+  mutate(log10_vir = ifelse(log10_vir <= 3, 2, log10_vir),
+         DOI = as.factor(DOI),
+         out = factor(out, levels=c("Severe dengue", "Plasma leakage")),
+         Study = factor(Study, levels=c("DR","MD","22DX"), labels=c("Study A","Study B","Study C")))
+
+p4 <- ggplot(pdat, aes(x = log10_vir, y = pred)) +
+  geom_ribbon(data = filter(pdat, log10_vir>2), aes(ymin = low, ymax = upp, fill = Study), alpha = .15) +
+  geom_line(data = filter(pdat, log10_vir>2), aes(color = Study), alpha = .7) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(ymin = low, ymax = upp, color = Study), width=.2, linewidth=.5, alpha=0.6, position = position_dodge(.6)) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(color = Study), size = 1.2, position = position_dodge(.6)) +
+  labs(x = "Viremia levels (log-10 copies/ml)", y = "Probability of occurrence") +
+  scale_x_continuous(breaks = 2:10, labels = c("U", 3:10)) +
+  scale_y_continuous(breaks = c(0:4)*.1, labels = c("0%","10%","20%","30%","40%")) +
+  scale_fill_discrete(name = "(D) Study          ") +
+  scale_color_discrete(name = "(D) Study          ") +
+  theme(legend.position = "top", legend.justification = 'left', legend.title = element_text(face = "bold")) +
+  facet_grid(rows = vars(out), cols = vars(DOI), labeller = labeller(DOI = DOI.labs), scales = "free") +
+  coord_cartesian_panels(
+    panel_limits = tibble::tribble(
+      ~out, ~ymin, ~ymax, 
+      "Severe dengue", -.005, .26,
+      "Plasma leakage", -.01, .48
+    )
+  )
+
+
+# Combine plots
+p <- grid.arrange(p1, p2, p3, p4, ncol=1, heights=c(1,1,1,1.05))
+
+ggsave("A7_Fig2.jpg", p, width=9, height=13)
+```
+
+
+############################################################
+### Appendix 7-figure 3. Probability of occurrence of the two clinical endpoints according to viremia levels – compare results from the supermodels with and without multiple imputation
+```{r Appendix 7-figure 3, message=TRUE, warning=TRUE, include=FALSE}
+DOI.labs <- c("LM day 1", "LM day 2", "LM day 3", "LM day 4", "LM day 5", "LM day 6", "LM day 7")
+names(DOI.labs) <- c("1", "2", "3", "4", "5", "6", "7")
+
+## Plot predictions for severe dengue----------------------------------------------------------------
+pms <- bind_rows(mutate(pms1, method = "Without multiple imputation"), mutate(pmsi1, method = "With multiple imputation"))
+
+pdat <- pms %>%
+  filter(Age==10, Sex=="Male", Study=="22DX", Serology=="Probable secondary") %>%
+  mutate(log10_vir = ifelse(log10_vir <= 3, 2, log10_vir),
+         DOI = as.factor(DOI))
+
+p1 <- ggplot(pdat, aes(x = log10_vir, y = pred)) +
+  geom_ribbon(data = filter(pdat, log10_vir>2), aes(ymin = low, ymax = upp, fill = method), alpha = .15) +
+  geom_line(data = filter(pdat, log10_vir>2), aes(color = method), alpha = .7) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(ymin = low, ymax = upp, color = method), width=.2, linewidth=.5, alpha=0.6, position = position_dodge(.6)) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(color = method), size = 1.2, position = position_dodge(.6)) +
+  labs(x = "Viremia levels (log-10 copies/ml)", subtitle = "(A) Probability of severe dengue") +
+  scale_x_continuous(breaks = 2:10, labels = c("U", 3:10)) +
+  scale_y_continuous(breaks = c(0:4)*.05, labels = c("0%","5%","10%","15%","20%")) +
+  coord_cartesian(ylim = c(0, .23)) +
+  theme(axis.title.y=element_blank(), legend.position = "top", legend.title = element_blank()) +
+  facet_grid(rows = vars(Serotype), cols = vars(DOI), labeller = labeller(DOI = DOI.labs))
+
+## Plot predictions for plasma leakage----------------------------------------------------------------
+pml <- bind_rows(mutate(pml1, method = "Without multiple imputation"), mutate(pmli1, method = "With multiple imputation"))
+
+pdat <- pml %>%
+  filter(Age==10, Sex=="Male", Study=="22DX", Serology=="Probable secondary") %>%
+  mutate(log10_vir = ifelse(log10_vir <= 3, 2, log10_vir),
+         DOI = as.factor(DOI))
+
+p2 <- ggplot(pdat, aes(x = log10_vir, y = pred)) +
+  geom_ribbon(data = filter(pdat, log10_vir>2), aes(ymin = low, ymax = upp, fill = method), alpha = .15) +
+  geom_line(data = filter(pdat, log10_vir>2), aes(color = method), alpha = .7) +
+  geom_errorbar(data = filter(pdat, log10_vir==2), aes(ymin = low, ymax = upp, color = method), width=.2, linewidth=.5, alpha=0.6, position = position_dodge(.6)) +
+  geom_point(data = filter(pdat, log10_vir==2), aes(color = method), size = 1.2, position = position_dodge(.6)) +
+  labs(x = "Viremia levels (log-10 copies/ml)", subtitle = "(B) Probability of plasma leakage") +
+  scale_x_continuous(breaks = 2:10, labels = c("U", 3:10)) +
+  scale_y_continuous(breaks = c(0:4)*.1, labels = c("0%","10%","20%","30%","40%")) +
+  coord_cartesian(ylim = c(0, .45)) +
+  theme(axis.title.y=element_blank(), legend.position = "top", legend.title = element_blank()) +
+  facet_grid(rows = vars(Serotype), cols = vars(DOI), labeller = labeller(DOI = DOI.labs))
+
+### Combine plots----------------------------------------------------------------
+library(ggpubr)
+p <- ggarrange(p1, p2, nrow=2, common.legend = T, legend = "top", label.x = "Viremia levels (log-10 copies/ml)")
+
+ggsave("A7_Fig3.jpg", p, width=8, height=9)
+```
+
+
+############################################################
+### Appendix 7-figure 4. Probability of occurrence of the two clinical endpoints according to the covariates - results from the supermodel
+```{r Appendix 7-figure 4, echo=FALSE, message=FALSE, warning=FALSE}
+library(ggpubr)
+
+# Severe dengue----------------------------------------------------------------------------------------
+### Serotype
+pdat <- bind_rows(mutate(pms1, method = "Without multiple imputation"), mutate(pmsi1, method = "With multiple imputation")) %>%
+  filter(Age==10, Sex=="Male", log10_vir==7, DOI==4, Study=="22DX") %>%
+  mutate(Serology = factor(Serology, levels = c("Probable primary","Probable secondary","Indeterminate")),
+         Serotype = factor(Serotype, levels = c("DENV-1","DENV-2","DENV-3","DENV-4"), labels = c("D1","D2","D3","D4")))
+
+p1a <- ggplot(pdat, aes(x = Serotype, y = pred, color = method)) +
+  geom_errorbar(aes(ymin = low, ymax = upp), width=.2, size=.6, alpha=0.6, position = position_dodge(.4)) +
+  geom_point(size = 1.5, position = position_dodge(.4)) +
+  labs(x = "Serotype", y = "Probability of occurrence", subtitle = "(A) Severe dengue") +
+  scale_y_continuous(breaks = c(0:4)*.05, labels = c("0%", "5%", "10%", "15%", "20%")) +
+  coord_cartesian(ylim = c(0, .18)) +
+  theme(legend.position = "top", legend.title = element_blank(), axis.title.y = element_blank()) +
+  facet_grid(cols = vars(Serology))
+
+### Immune status
+pdat <- bind_rows(mutate(pms1, method = "Without multiple imputation"), mutate(pmsi1, method = "With multiple imputation")) %>% 
+  filter(Age==10, Sex=="Male", log10_vir==7, DOI==4, Study=="22DX") %>%
+  mutate(Serology = factor(Serology, levels = c("Probable primary","Probable secondary","Indeterminate"), labels = c("Prim", "Sec", "Ind")))
+
+p1b <- ggplot(pdat, aes(x = Serology, y = pred, color = method)) +
+  geom_errorbar(aes(ymin = low, ymax = upp), width=.2, size=.6, alpha=0.6, position = position_dodge(.4)) +
+  geom_point(size = 1.5, position = position_dodge(.4)) +
+  labs(x = "Immune status", y = "Probability of occurrence") +
+  scale_y_continuous(breaks = c(0:4)*.05, labels = c("0%", "5%", "10%", "15%", "20%")) +
+  coord_cartesian(ylim = c(0, .18)) +
+  theme(legend.position = "top", legend.title = element_blank(), axis.title.y = element_blank()) +
+  facet_grid(cols = vars(Serotype))
+
+### Age
+pdat <- bind_rows(mutate(pms1, method = "Without multiple imputation"), mutate(pmsi1, method = "With multiple imputation")) %>% 
+  filter(Serotype=="DENV-1", Serology=="Probable secondary", Sex=="Male", log10_vir==7, DOI==4, Study=="22DX")
+
+p1c <- ggplot(pdat, aes(x = Age, y = pred)) +
+  geom_ribbon(aes(ymin = low, ymax = upp, fill = method), alpha = .2) +
+  geom_line(aes(color = method), alpha = .7) +
+  labs(x = "Age (years)", y = "Probability of occurrence") +
+  scale_y_continuous(breaks = c(0:4)*.05, labels = c("0%", "5%", "10%", "15%", "20%")) +
+  scale_x_continuous(breaks = c(1:10)*5) +
+  coord_cartesian(ylim = c(0, .15)) +
+  theme(legend.position = "top", legend.title = element_blank(), axis.title.y = element_blank())
+
+### Sex
+pdat <- bind_rows(mutate(pms1, method = "Without multiple imputation"), mutate(pmsi1, method = "With multiple imputation")) %>% 
+  filter(Age==10, Serotype=="DENV-1", Serology=="Probable secondary", log10_vir==7, DOI==4, Study=="22DX")
+
+p1d <- ggplot(pdat, aes(x = Sex, y = pred, color = method)) +
+  geom_errorbar(aes(ymin = low, ymax = upp), width=.2, size=.6, alpha=0.6, position = position_dodge(.4)) +
+  geom_point(size = 1.5, position = position_dodge(.4)) +
+  labs(x = "Sex", y = "Probability of occurrence") +
+  scale_y_continuous(breaks = c(0:4)*.05, labels = c("0%", "5%", "10%", "15%", "20%")) +
+  coord_cartesian(ylim = c(0, .15)) +
+  theme(legend.position = "top", legend.title = element_blank(), axis.title.y = element_blank())
+
+### Study
+pdat <- bind_rows(mutate(pms1, method = "Without multiple imputation"), mutate(pmsi1, method = "With multiple imputation")) %>% 
+  filter(Age==10, Serotype=="DENV-1", Serology=="Probable secondary", log10_vir==7, DOI==4, Sex=="Male") %>%
+  mutate(Study = factor(Study, levels=c("DR","MD","22DX"), labels=c("A","B","C")))
+
+p1e <- ggplot(pdat, aes(x = Study, y = pred, color = method)) +
+  geom_errorbar(aes(ymin = low, ymax = upp), width=.2, size=.6, alpha=0.6, position = position_dodge(.4)) +
+  geom_point(size = 1.5, position = position_dodge(.4)) +
+  labs(x = "Study", y = "Probability of occurrence") +
+  scale_y_continuous(breaks = c(0:4)*.05, labels = c("0%", "5%", "10%", "15%", "20%")) +
+  coord_cartesian(ylim = c(0, .15)) +
+  theme(legend.position = "top", legend.title = element_blank(), axis.title.y = element_blank())
+
+### Combine plots
+p1f <- ggarrange(p1d, p1e, nrow=1, widths=c(1,1.2), common.legend = T, legend = "none")
+p1 <- ggarrange(p1a, p1b, p1c, p1f, nrow=4, heights=c(1.12,1.05,1,1), common.legend = T, legend = "top")
+
+# Plasma leakage----------------------------------------------------------------------------------------
+### Serotype
+pdat <- bind_rows(mutate(pml1, method = "Without multiple imputation"), mutate(pmli1, method = "With multiple imputation")) %>% 
+  filter(Age==10, Sex=="Male", log10_vir==7, DOI==4, Study=="22DX") %>%
+  mutate(Serology = factor(Serology, levels = c("Probable primary","Probable secondary","Indeterminate")),
+         Serotype = factor(Serotype, levels = c("DENV-1","DENV-2","DENV-3","DENV-4"), labels = c("D1","D2","D3","D4")))
+
+p2a <- ggplot(pdat, aes(x = Serotype, y = pred, color = method)) +
+  geom_errorbar(aes(ymin = low, ymax = upp), width=.2, size=.6, alpha=0.6, position = position_dodge(.4)) +
+  geom_point(size = 1.5, position = position_dodge(.4)) +
+  labs(x = "Serotype", y = "Probability of occurrence", subtitle = "(B) Plasma leakage") +
+  scale_y_continuous(breaks = c(0:4)*.1, labels = c("0%", "10%", "20%", "30%", "40%")) +
+  coord_cartesian(ylim = c(0, .35)) +
+  theme(legend.position = "top", legend.title = element_blank(), axis.title.y = element_blank()) +
+  facet_grid(cols = vars(Serology))
+
+### Immune status
+pdat <- bind_rows(mutate(pml1, method = "Without multiple imputation"), mutate(pmli1, method = "With multiple imputation")) %>%
+  filter(Age==10, Sex=="Male", log10_vir==7, DOI==4, Study=="22DX") %>%
+  mutate(Serology = factor(Serology, levels = c("Probable primary","Probable secondary","Indeterminate"), labels = c("Prim", "Sec", "Ind")))
+
+p2b <- ggplot(pdat, aes(x = Serology, y = pred, color = method)) +
+  geom_errorbar(aes(ymin = low, ymax = upp), width=.2, size=.6, alpha=0.6, position = position_dodge(.4)) +
+  geom_point(size = 1.5, position = position_dodge(.4)) +
+  labs(x = "Immune status", y = "Probability of occurrence") +
+  scale_y_continuous(breaks = c(0:4)*.1, labels = c("0%", "10%", "20%", "30%", "40%")) +
+  coord_cartesian(ylim = c(0, .35)) +
+  theme(legend.position = "top", legend.title = element_blank(), axis.title.y = element_blank()) +
+  facet_grid(cols = vars(Serotype))
+
+### Age
+pdat <- bind_rows(mutate(pml1, method = "Without multiple imputation"), mutate(pmli1, method = "With multiple imputation")) %>% 
+  filter(Serotype=="DENV-1", Serology=="Probable secondary", Sex=="Male", log10_vir==7, DOI==4, Study=="22DX")
+
+p2c <- ggplot(pdat, aes(x = Age, y = pred)) +
+  geom_ribbon(aes(ymin = low, ymax = upp, fill = method), alpha = .2) +
+  geom_line(aes(color = method), alpha = .7) +
+  labs(x = "Age (years)", y = "Probability of occurrence") +
+  scale_x_continuous(breaks = c(1:10)*5) +
+  scale_y_continuous(breaks = c(0:4)*.1, labels = c("0%", "10%", "20%", "30%", "40%")) +
+  coord_cartesian(ylim = c(0, .35)) +
+  theme(legend.position = "top", legend.title = element_blank(), axis.title.y = element_blank())
+
+### Sex
+pdat <- bind_rows(mutate(pml1, method = "Without multiple imputation"), mutate(pmli1, method = "With multiple imputation")) %>%
+  filter(Age==10, Serotype=="DENV-1", Serology=="Probable secondary", log10_vir==7, DOI==4, Study=="22DX")
+
+p2d <- ggplot(pdat, aes(x = Sex, y = pred, color = method)) +
+  geom_errorbar(aes(ymin = low, ymax = upp), width=.2, size=.6, alpha=0.6, position = position_dodge(.4)) +
+  geom_point(size = 1.5, position = position_dodge(.4)) +
+  labs(x = "Sex", y = "Probability of occurrence") +
+  scale_y_continuous(breaks = c(0:4)*.1, labels = c("0%", "10%", "20%", "30%", "40%")) +
+  coord_cartesian(ylim = c(0, .35)) +
+  theme(legend.position = "top", legend.title = element_blank(), axis.title.y = element_blank())
+
+### Study
+pdat <- bind_rows(mutate(pml1, method = "Without multiple imputation"), mutate(pmli1, method = "With multiple imputation")) %>% 
+  filter(Age==10, Serotype=="DENV-1", Serology=="Probable secondary", log10_vir==7, DOI==4, Sex=="Male") %>%
+  mutate(Study = factor(Study, levels=c("DR","MD","22DX"), labels=c("A","B","C")))
+
+p2e <- ggplot(pdat, aes(x = Study, y = pred, color = method)) +
+  geom_errorbar(aes(ymin = low, ymax = upp), width=.2, size=.6, alpha=0.6, position = position_dodge(.4)) +
+  geom_point(size = 1.5, position = position_dodge(.4)) +
+  labs(x = "Study", y = "Probability of occurrence") +
+  scale_y_continuous(breaks = c(0:4)*.1, labels = c("0%", "10%", "20%", "30%", "40%")) +
+  coord_cartesian(ylim = c(0, .4)) +
+  theme(legend.position = "top", legend.title = element_blank(), axis.title.y = element_blank())
+
+### Combine plots
+p2f <- ggarrange(p2d, p2e, nrow=1, widths=c(1,1.2), common.legend = T, legend = "none")
+p2 <- ggarrange(p2a, p2b, p2c, p2f, nrow=4, heights=c(1.12,1.05,1,1), common.legend = T, legend = "top")
+
+p <- ggarrange(p1, p2, nrow=1, common.legend = T, legend = "top")
+
+ggsave("A7_Fig4.jpg", p, width=8, height=9)
+```
+
+
+############################################################
+### Appendix 7-table 2. Estimates from models of the rate of decline in viremia and clinical outcomes
+```{r Appendix 7-table 2, echo=FALSE, message=FALSE, warning=FALSE}
+## Severe dengue
+dd <- datadist(dat_slope); options(datadist = "dd")
+ms3b <- lrm(Severe_dengue ~ Slope + Serotype + Serology + PCR, data=dat_slope)
+
+get_or1 <- function(x) {
+  tmp <- summary(ms3b, Slope=c(1,1.5), Serotype="DENV-1", Serology="Probable primary", PCR="One-step") %>% as.data.frame(.)
+  return(tmp)
+}
+
+df1 <- data.frame(
+  var = c("Slope",
+          "Serotype=DENV-2", "Serotype=DENV-3", "Serotype=DENV-4",
+          "Serology=Probable secondary", "Serology=Indeterminate",
+          "PCR=Two-step"),
+  or = c(get_or1(11)[2,4], get_or1(11)[4,4], get_or1(11)[6,4], get_or1(11)[8,4], get_or1(11)[10,4], get_or1(11)[12,4], get_or1(11)[14,4]),
+  lo = c(get_or1(11)[2,6], get_or1(11)[4,6], get_or1(11)[6,6], get_or1(11)[8,6], get_or1(11)[10,6], get_or1(11)[12,6], get_or1(11)[14,6]),
+  up = c(get_or1(11)[2,7], get_or1(11)[4,7], get_or1(11)[6,7], get_or1(11)[8,7], get_or1(11)[10,7], get_or1(11)[12,7], get_or1(11)[14,7])
+) %>%
+  mutate(or = sprintf("%.2f", round(or, 2)),
+         lo = sprintf("%.2f", round(lo, 2)),
+         up = sprintf("%.2f", round(up, 2)),
+         or1 = paste(or, " (", lo, "; ", up, ")", sep="")) %>%
+  select(var, or1)
+
+p1 <- data.frame(var = rownames(anova(ms3b)),
+                 p1 = data.frame(anova(ms3b))$P) %>%
+  mutate(var = gsub(pattern="  (Factor+Higher Order Factors)", replacement="", x=var, fixed=T)) %>%
+  mutate(p1 = ifelse(p1<.001, "<0.001", sprintf("%.3f", round(p1, 3))))
+
+## Plasma leakage
+dd <- datadist(dat_slope); options(datadist = "dd")
+mp3b <- lrm(Leakage ~ Slope * (Serotype + Serology + PCR), data=dat_slope)
+
+get_or2 <- function(x) {
+  serotype <- ifelse(x<20, "DENV-1", ifelse(x<30, "DENV-2", ifelse(x<40, "DENV-3", "DENV-4")))
+  serology <- ifelse(x %in% c(11,21,31,41), "Probable primary", "Probable secondary")
+  tmp <- summary(mp3b, Slope=c(1,1.5), Serotype=serotype, Serology=serology, PCR="One-step") %>% as.data.frame(.)
+  return(tmp)
+}
+
+df2 <- data.frame(
+  var = c("11", "12", "21", "22", "31", "32", "41", "42",
+          "Serotype=DENV-2", "Serotype=DENV-3", "Serotype=DENV-4",
+          "Serology=Probable secondary", "Serology=Indeterminate",
+          "PCR=Two-step"),
+  or = c(get_or2(11)[2,4], get_or2(12)[2,4], get_or2(21)[2,4], get_or2(22)[2,4], get_or2(31)[2,4], get_or2(32)[2,4], get_or2(41)[2,4], get_or2(42)[2,4],
+         get_or2(11)[4,4], get_or2(11)[6,4], get_or2(11)[8,4], get_or2(11)[10,4], get_or2(11)[12,4], get_or2(11)[14,4]),
+  lo = c(get_or2(11)[2,6], get_or2(12)[2,6], get_or2(21)[2,6], get_or2(22)[2,6], get_or2(31)[2,6], get_or2(32)[2,6], get_or2(41)[2,6], get_or2(42)[2,6],
+         get_or2(11)[4,6], get_or2(11)[6,6], get_or2(11)[8,6], get_or2(11)[10,6], get_or2(11)[12,6], get_or2(11)[14,6]),
+  up = c(get_or2(11)[2,7], get_or2(12)[2,7], get_or2(21)[2,7], get_or2(22)[2,7], get_or2(31)[2,7], get_or2(32)[2,7], get_or2(41)[2,7], get_or2(42)[2,7],
+         get_or2(11)[4,7], get_or2(11)[6,7], get_or2(11)[8,7], get_or2(11)[10,7], get_or2(11)[12,7], get_or2(11)[14,7])
+) %>%
+  mutate(or = sprintf("%.2f", round(or, 2)),
+         lo = sprintf("%.2f", round(lo, 2)),
+         up = sprintf("%.2f", round(up, 2)),
+         or2 = paste(or, " (", lo, "; ", up, ")", sep="")) %>%
+  select(var, or2)
+
+p2 <- data.frame(var = rownames(anova(mp3b)),
+                 p2 = data.frame(anova(mp3b))$P) %>%
+  mutate(var = gsub(pattern="  (Factor+Higher Order Factors)", replacement="", x=var, fixed=T)) %>%
+  mutate(p2 = ifelse(p2<.001, "<0.001", sprintf("%.3f", round(p2, 3))))
+
+## Combine results
+res <- data.frame(
+  var = c("Slope", "11", "12", "21", "22", "31", "32", "41", "42",
+          "Serotype", "Serotype=DENV-1", "Serotype=DENV-2", "Serotype=DENV-3", "Serotype=DENV-4",
+          "Serology", "Serology=Probable primary", "Serology=Probable secondary", "Serology=Indeterminate",
+          "PCR", "PCR=One-step", "PCR=Two-step",
+          "Interaction of slope", "Slope * Serotype", "Slope * Serology", "Slope * PCR"),
+  name = c("Rate of decline in viremia",
+           "- DENV-1 - probable primary", "- DENV-1 - probable secondary",
+           "- DENV-2 - probable primary", "- DENV-2 - probable secondary",
+           "- DENV-3 - probable primary", "- DENV-3 - probable secondary",
+           "- DENV-4 - probable primary", "- DENV-4 - probable secondary",
+           "Serotype", "- DENV-1", "- DENV-2", "- DENV-3", "- DENV-4",
+           "Immune status", "- Probable primary", "- Probable secondary", "- Indeterminate",
+           "PCR method", "- One-step", "- Two-step",
+           "Interaction of rate of decline in viremia", "- With serotype", "- With immune status", "- With PCR")
+) %>%
+  left_join(df1, by="var") %>%
+  left_join(p1, by="var") %>%
+  left_join(df2, by="var") %>%
+  left_join(p2, by="var") %>%
+  select(-var) %>%
+  as.data.frame()
+
+knitr::kable(res)
+```
+
