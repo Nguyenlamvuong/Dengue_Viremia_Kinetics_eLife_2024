@@ -1,0 +1,1 @@
+This repository contains R codes for the article entitled "Dengue Viremia Kinetics and Effects on Platelet Count and Clinical Outcomes: An Analysis of 2340 Patients from Vietnam" published by eLife in 2024 (https://doi.org/10.7554/eLife.92606.1).
